@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write  # create the Release and upload assets
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: laser_halftone-linux-x86_64
+            bin: laser_halftone
+          - os: macos-latest
+            asset: laser_halftone-macos-arm64
+            bin: laser_halftone
+          - os: windows-latest
+            asset: laser_halftone-windows-x86_64.exe
+            bin: laser_halftone.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # egui (eframe) + rfd need X11/GL and GTK dev headers to build on Linux.
+      - name: Install GUI system deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libxcb-render0-dev \
+            libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
+
+      - name: Build release
+        run: cargo build --release --verbose
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir dist
+          cp "target/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/${{ matrix.asset }}
+          # Auto-generate release notes from commits; keep as draft=false.
+          generate_release_notes: true

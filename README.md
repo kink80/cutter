@@ -1,5 +1,9 @@
 # laser_halftone
 
+[![CI](https://github.com/kink80/cutter/actions/workflows/ci.yml/badge.svg)](https://github.com/kink80/cutter/actions/workflows/ci.yml)
+
+Prebuilt binaries for Linux/macOS/Windows are attached to each [release](https://github.com/kink80/cutter/releases) (push a `v*` tag to cut one).
+
 Turn a photo into layered, laser-cuttable **stencils** you spray paint through to
 reproduce the image.
 
