@@ -1,0 +1,12 @@
+/target
+.DS_Store
+
+# Sample input images and generated output (not source)
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.svg
+*.pdf
+*_palette.txt
+--format_palette.txt
