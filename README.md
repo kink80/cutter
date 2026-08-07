@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/kink80/cutter/actions/workflows/ci.yml/badge.svg)](https://github.com/kink80/cutter/actions/workflows/ci.yml)
 
-Prebuilt binaries for Linux/macOS/Windows are attached to each [release](https://github.com/kink80/cutter/releases) (push a `v*` tag to cut one).
+Prebuilt binaries for Linux/macOS/Windows are attached to every [release](https://github.com/kink80/cutter/releases/latest).
 
 Turn a photo into layered, laser-cuttable **stencils** you spray paint through to
 reproduce the image.
@@ -22,14 +22,37 @@ There are two independent pipelines:
 - **Stencil** — multicolour spray masks. Quantizes the image to N flat colours
   (k-means in Lab space) and traces each colour into a smoothed cut layer.
 
-## Install & run
+## Install
 
-Rust (edition 2024). Build with Cargo:
+Download the binary for your OS from the [latest release](https://github.com/kink80/cutter/releases/latest):
+
+| OS | file |
+|----|------|
+| Linux | `laser_halftone-linux-x86_64` |
+| macOS (Apple Silicon) | `laser_halftone-macos-arm64` |
+| Windows | `laser_halftone-windows-x86_64.exe` |
+
+On Linux/macOS mark it executable and (optionally) put it on your `PATH`:
 
 ```sh
-cargo run --release -- gui                 # interactive app
-cargo run --release -- halftone --input photo.jpg --spacing-px 8 --min-material-px 1 --min-cut-px 0.5
-cargo run --release -- stencil  --input photo.jpg --colors 4
+chmod +x laser_halftone-linux-x86_64
+mv laser_halftone-linux-x86_64 ~/.local/bin/laser_halftone   # now just `laser_halftone`
+```
+
+macOS Gatekeeper may block an unsigned binary the first time — right-click → Open, or
+`xattr -d com.apple.quarantine laser_halftone-macos-arm64`. On Windows, run the `.exe`
+directly (the examples below use `laser_halftone` — substitute the full filename).
+
+> Prefer building from source? It's a plain Rust (edition 2024) project — clone it and run
+> `cargo run --release -- <subcommand> …`. Every example below works from source too: just
+> replace `laser_halftone` with `cargo run --release --`.
+
+## Run
+
+```sh
+laser_halftone gui                                                              # interactive app
+laser_halftone halftone --input photo.jpg --spacing-px 8 --min-material-px 1 --min-cut-px 0.5
+laser_halftone stencil  --input photo.jpg --colors 4
 ```
 
 The GUI lets you open an image, tweak every parameter with a live preview, and
@@ -38,6 +61,32 @@ The GUI lets you open an image, tweak every parameter with a live preview, and
 Output for an N-ink halftone is one SVG per ink (`out_c.svg`, `out_m.svg`, …), each with
 corner **punch holes + registration crosshairs** at identical coordinates so the sheets
 pin onto alignment pins and line up, plus a composite `out_preview.png`.
+
+## Snapshots
+
+A photo run through each pipeline (`--format png` renders these composite previews;
+production runs emit the per-ink / per-colour **SVGs** you actually cut):
+
+| input photo | halftone (blue-noise AM+FM) | stencil layer (bridged) |
+|:---:|:---:|:---:|
+| ![source](docs/img/source.jpg) | ![halftone blue-noise preview](docs/img/halftone-bluenoise.png) | ![stencil layer with bridges](docs/img/stencil-layer.png) |
+
+```sh
+# left -> middle: variable-size FM screen, composite PNG preview
+laser_halftone halftone --input photo.jpg --shape blue-noise \
+  --spacing-px 8 --min-material-px 1 --min-cut-px 0.5 --dot-min-px 1 --dot-max-px 6 \
+  --format png --out-prefix preview
+
+# left -> right: one bridged colour layer of a 6-colour split
+laser_halftone stencil --input photo.jpg --colors 6 \
+  --bridges on --min-material-px 2 --min-feature-px 3 --format png --out-prefix layer
+```
+
+The interactive GUI shows the same preview live while you drag any parameter:
+
+```sh
+laser_halftone gui
+```
 
 ## Halftone mode
 
@@ -68,7 +117,7 @@ curve), `--bilateral-px` (edge-preserving pre-filter), `--auto-levels on`, and
 `--paper A2|A3|A4|A5` + `--margin-mm` to emit at true physical size on a sheet.
 
 ```sh
-cargo run --release -- halftone --input photo.jpg \
+laser_halftone halftone --input photo.jpg \
   --spacing-px 8 --min-material-px 1 --min-cut-px 0.5 \
   --shape hatch --inks cmykog --paper A4 --margin-mm 10 --out-prefix art
 ```
@@ -79,7 +128,7 @@ Splits the image into N solid-colour layers (Inkscape "Trace Bitmap → Multicol
 darkest first (spray order). Outputs one traced SVG per colour plus a palette.
 
 ```sh
-cargo run --release -- stencil --input photo.jpg --colors 6 \
+laser_halftone stencil --input photo.jpg --colors 6 \
   --bridges on --min-material-px 2 --min-feature-px 3 --out-prefix poster
 ```
 

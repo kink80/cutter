@@ -10,3 +10,7 @@
 *.pdf
 *_palette.txt
 --format_palette.txt
+
+# ...but keep committed README screenshots
+!docs/img/
+!docs/img/**
