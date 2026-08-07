@@ -102,6 +102,19 @@ kerf shrink) and are cut-safe — material always holds together.
 | `blue-noise` | frequency-modulated screen: dots placed at variable frequency (error diffusion). No grid, no moiré; forgiving of hand-registration. `--dot-min-px`/`--dot-max-px` also scale dot *size* with tone (AM+FM hybrid) for finer detail; default is fixed size. Sizes clamp cut-safe |
 | `hatch` | line screen whose local angle follows the image's dominant edge orientation, so cuts run *along* features. Bin seams narrow rather than collide, preserving the minimum gap |
 
+The same photo (see [Snapshots](#snapshots)) through each `--shape`:
+
+| `lines` | `wavy` | `dots` |
+|:---:|:---:|:---:|
+| ![lines shape](docs/img/shapes/lines.png) | ![wavy shape](docs/img/shapes/wavy.png) | ![dots shape](docs/img/shapes/dots.png) |
+| **`blue-noise`** | **`hatch`** | |
+| ![blue-noise shape](docs/img/shapes/blue-noise.png) | ![hatch shape](docs/img/shapes/hatch.png) | |
+
+```sh
+laser_halftone halftone --input photo.jpg --shape <lines|wavy|dots|blue-noise|hatch> \
+  --spacing-px 8 --min-material-px 1 --min-cut-px 0.5 --format png --out-prefix demo
+```
+
 **Inks.** `--inks cmyk` (default) or `--inks cmykog` for an extended gamut (adds orange +
 green for cleaner oranges/greens than muddy C+M+Y overlap). Screen angles: `--angles
 15,75,0,45[,…]` (one per ink), or the legacy per-channel `--angle-c/m/y/k`.
