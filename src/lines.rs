@@ -1184,18 +1184,29 @@ mod tests {
     fn degenerate_levels_do_not_panic_the_rasterizer() {
         // Repro: white-point == black-point (both 0.0 in the GUI). A map pixel equal
         // to the coincident point gave `levels` 0.0/0.0 = NaN -> NaN ribbon coords ->
-        // partial_cmp().unwrap() panic in rasterize. Map MUST contain 0.0 to trigger.
-        // A real photo mixes pixels AT the coincident level point (-> NaN density from
-        // the old 0/0) with pixels above it (-> finite). A ribbon then has BOTH finite
-        // and NaN coords: finite ones give it a valid scanline range, the NaN crossing
-        // inside it panicked the float sort. A uniform all-NaN map would NOT reproduce
-        // (its bbox collapses to empty). Use the real image — the exact GUI scenario.
-        let (w, h) = crate::image_size("cata.jpg").unwrap();
-        let layers = crate::cmyk::load("cata.jpg", w, h).unwrap();
+        // partial_cmp().unwrap() panic in rasterize. The map MUST MIX pixels AT the
+        // coincident point (density 0.0 -> old 0/0 NaN) with pixels above it (finite),
+        // so one ribbon gets BOTH finite and NaN coords: the finite ones give it a
+        // valid scanline range, the NaN crossing inside it panicked the float sort.
+        // A uniform map would NOT reproduce (all-NaN bbox collapses to empty). We build
+        // a synthetic density channel with that exact mix — no image file needed.
+        let (w, h) = (64usize, 64usize);
+        // Horizontal gradient: left column density 0.0 (the coincident point), rising
+        // to the right. Every screen ribbon spans the 0.0 band and the finite band.
+        let density: Vec<f32> = (0..w * h)
+            .map(|i| (i % w) as f32 / (w - 1) as f32)
+            .collect();
+        let ch = crate::cmyk::Channel {
+            density,
+            angle: 15.0,
+            display_rgb: [0.0, 1.0, 1.0],
+            name: "Cyan",
+            suffix: "c",
+            tamed: false,
+        };
         let p = LineParams { white_point: 0.0, black_point: 0.0, ..base() };
-        let chans = crate::cmyk::channels(&layers, crate::cmyk::Inks::Cmyk, &[15.0, 75.0, 0.0, 45.0]);
         // render_preview runs generate_all + rasterize — the exact GUI path.
-        let img = render_preview(&chans, w, h, &p, false);
+        let img = render_preview(&[ch], w, h, &p, false);
         assert_eq!(img.dimensions(), (w as u32, h as u32), "renders without panicking");
     }
 
