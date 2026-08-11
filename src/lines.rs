@@ -93,6 +93,10 @@ pub struct LineParams {
     pub black_point: f32,
     pub gamma: f32,
     pub scurve: f32,           // spray S-curve strength (0 = off); see `scurve`
+    /// Per-ink cut-width scale in (0,1], set from `Channel::load` by `generate_all`.
+    /// Scales the commanded width AND the max-cut budget together, so the whole
+    /// density->width ramp compresses instead of clipping. 1.0 = unchanged.
+    pub load: f32,
 
     // --- K-channel taming (black is opaque; keep it thin and deep) ---
     pub k_mode: KMode,         // Tonal (trimmed screen) or Contour (DoG edges)
@@ -140,7 +144,10 @@ fn tone(d: f32, p: &LineParams) -> f32 {
 /// every shape applies the SAME dead-zone / kerf / max-cut rules (see the width rule
 /// inline in `generate_quads_capped`). `d` is already tone-mapped.
 fn cut_extent(d: f32, p: &LineParams, max_cut: f32) -> f32 {
-    let raw = d * p.spacing_px; // PDF: W_raw = D * P
+    // `load` scales the ramp; `generate_all` scales `max_cut` by the same factor, so
+    // lowering it compresses this ink's whole tonal range rather than clipping its
+    // dark end (which is what a ceiling-only cap would do).
+    let raw = d * p.spacing_px * p.load; // PDF: W_raw = D * P
     if raw < p.w_min_px {
         0.0 // dead-zone: fragile hairlines are not cut at all
     } else {
@@ -855,15 +862,25 @@ pub fn generate_all(
         .iter()
         .map(|ch| {
             if ch.tamed {
+                // ponytail: tamed inks ignore `load` — K already has its own ceiling
+                // (`k_width_frac`), which is a cap PAIRED with a tonal rescale
+                // (`deep_clip` + `k_gamma`), not a linear load scale. Upgrade path:
+                // express `k_width_frac` as a `load` once `deep_clip` is proven
+                // equivalent to that rescale.
                 generate_tamed(&ch.density, &under, w, h, p, ch.angle)
             } else {
                 let cp = if auto {
+                    // ponytail: with auto on, `auto_levels` maps this channel's p99.5
+                    // to full cut before `load` scales it, so the mid-tone effect of a
+                    // lowered load reads weaker than expected. Stiffness is still
+                    // bounded, because `load` also scales the ceiling below.
                     let (wp, bp) = crate::halftone::auto_levels(&ch.density, 0.005, 0.995);
-                    LineParams { white_point: wp, black_point: bp, ..*p }
+                    LineParams { white_point: wp, black_point: bp, load: ch.load, ..*p }
                 } else {
-                    *p
+                    LineParams { load: ch.load, ..*p }
                 };
-                generate_shape(&ch.density, w, h, ch.angle, &cp, max_cut_for(&cp))
+                // Scale the ceiling by the same factor as the ramp in `cut_extent`.
+                generate_shape(&ch.density, w, h, ch.angle, &cp, max_cut_for(&cp) * ch.load)
             }
         })
         .collect()
@@ -935,15 +952,27 @@ fn rasterize(ribbons: &[Ribbon], w: usize, h: usize) -> Vec<bool> {
 /// by that ink's transmission colour (`display_rgb`). This generalizes to any N inks
 /// and any colours; for the four CMYK inks (C=(0,1,1), M=(1,0,1), Y=(1,1,0), K=0) it is
 /// exactly the old `cmyk_to_rgb` subtractive mix for binary coverage.
+/// Also returns the per-layer stiffness readout, measured off the masks this render
+/// already built — so it costs one extra linear pass, not a second screening.
 pub fn render_preview(
     channels: &[crate::cmyk::Channel],
     w: usize,
     h: usize,
     p: &LineParams,
     auto: bool,
-) -> image::RgbImage {
+) -> (image::RgbImage, Vec<crate::fragility::Fragility>) {
     let quads = generate_all(channels, w, h, p, auto);
     let masks: Vec<Vec<bool>> = quads.iter().map(|q| rasterize(q, w, h)).collect();
+    // NOTE polarity: `rasterize` marks where the CUT is (it drives ink painting
+    // below), so the keep-mask `fragility::measure` wants is the inverse. Stencil
+    // masks are already keep-polarity — don't invert those.
+    let frag = masks
+        .iter()
+        .map(|m| {
+            let keep: Vec<bool> = m.iter().map(|&cut| !cut).collect();
+            crate::fragility::measure(&keep, w, h)
+        })
+        .collect();
     let mut buf = image::RgbImage::new(w as u32, h as u32);
     for (idx, px) in buf.pixels_mut().enumerate() {
         let mut rgb = [1.0f32; 3]; // start white
@@ -960,7 +989,7 @@ pub fn render_preview(
             (rgb[2] * 255.0) as u8,
         ]);
     }
-    buf
+    (buf, frag)
 }
 
 /// Write the 4 analytic cut SVGs + composite preview PNG. Each sheet carries corner
@@ -1000,10 +1029,21 @@ pub fn export(
         std::fs::write(&path, doc).map_err(|e| format!("write {path}: {e}"))?;
         eprintln!("wrote {path} ({} cut ribbons)", ribbons[i].len());
     }
-    let buf = render_preview(channels, w, h, p, auto);
+    let (buf, frag) = render_preview(channels, w, h, p, auto);
     let ppath = format!("{prefix}_preview.png");
     buf.save(&ppath).map_err(|e| format!("write {ppath}: {e}"))?;
     eprintln!("wrote {ppath} (analytic composite preview)");
+    // Stiffness per sheet: `neck` is the thinnest standing material. A sheet under
+    // ~1px of neck is lace and will lift or tear when sprayed.
+    for (ch, f) in channels.iter().zip(&frag) {
+        eprintln!(
+            "layer {}: cut {:.0}%, neck {:.1}px{}",
+            ch.suffix,
+            f.removed * 100.0,
+            f.neck_px,
+            if f.neck_px < 1.0 { "  <- fragile" } else { "" }
+        );
+    }
     Ok(())
 }
 
@@ -1025,6 +1065,7 @@ mod tests {
             black_point: 1.0,
             gamma: 1.0,
             scurve: 0.0,
+            load: 1.0,
             k_mode: KMode::Tonal,
             k_deep_clip: 0.75,
             k_gamma: 2.0,
@@ -1168,7 +1209,12 @@ mod tests {
         let mut p = base();
         p.ucr = 0.0; // don't suppress; we want K to fire
         p.k_width_frac = 0.40; // cap = 4px at pitch 10
-        let chans = crate::cmyk::channels(&layers, crate::cmyk::Inks::Cmyk, &[15.0, 75.0, 0.0, 0.0]);
+        let chans = crate::cmyk::channels(
+            &layers,
+            crate::cmyk::Inks::Cmyk,
+            &[15.0, 75.0, 0.0, 0.0],
+            &crate::cmyk::Inks::Cmyk.default_loads(),
+        );
         let out = generate_all(&chans, 60, 60, &p, false);
         let krib = &out[3];
         assert!(!krib.is_empty(), "full black produces K cut");
@@ -1199,6 +1245,7 @@ mod tests {
         let ch = crate::cmyk::Channel {
             density,
             angle: 15.0,
+            load: 1.0,
             display_rgb: [0.0, 1.0, 1.0],
             name: "Cyan",
             suffix: "c",
@@ -1206,7 +1253,7 @@ mod tests {
         };
         let p = LineParams { white_point: 0.0, black_point: 0.0, ..base() };
         // render_preview runs generate_all + rasterize — the exact GUI path.
-        let img = render_preview(&[ch], w, h, &p, false);
+        let (img, _) = render_preview(&[ch], w, h, &p, false);
         assert_eq!(img.dimensions(), (w as u32, h as u32), "renders without panicking");
     }
 
@@ -1469,5 +1516,67 @@ mod tests {
         for y in 0..h { for x in w/2..w { step[y * w + x] = 1.0; } }
         let e_step = dog_edges(&step, w, h, 1.0, 2.0, 0.02);
         assert!(e_step.iter().any(|&v| v > 0.0), "sharp step produces edges");
+    }
+
+    /// The magenta-heavy case: pulling ONE ink's load back must shrink that ink's
+    /// widest cut (so its sheet stays stiff) and leave every other ink bit-for-bit
+    /// untouched. The exact-equality check on C also pins the backwards-compat
+    /// promise: load 1.0 is an identity, not an approximation.
+    #[test]
+    fn per_ink_load_shrinks_only_that_ink() {
+        let (w, h) = (40usize, 40usize);
+        let mk = |d: f32, load: f32, name: &'static str| crate::cmyk::Channel {
+            density: vec![d; w * h],
+            angle: 0.0,
+            load,
+            display_rgb: [1.0, 0.0, 1.0],
+            name,
+            suffix: "x",
+            tamed: false,
+        };
+        let p = base(); // spacing 10, min_material 2 => full budget 8
+        let full = generate_all(&[mk(1.0, 1.0, "M"), mk(0.5, 1.0, "C")], w, h, &p, false);
+        let cut = generate_all(&[mk(1.0, 0.5, "M"), mk(0.5, 1.0, "C")], w, h, &p, false);
+        let widest = |rs: &[Ribbon]| rs.iter().map(ribbon_width).fold(0.0f32, f32::max);
+
+        // Saturated M clips at the budget; half load halves it.
+        assert!((widest(&full[0]) - 8.0).abs() < 0.01, "M full: {}", widest(&full[0]));
+        assert!((widest(&cut[0]) - 4.0).abs() < 0.01, "M loaded: {}", widest(&cut[0]));
+        // Standing material — the neck the stiffness readout measures — improved.
+        assert!(
+            p.spacing_px - widest(&cut[0]) > p.spacing_px - widest(&full[0]),
+            "lowering M's load must widen M's standing material"
+        );
+        // C is untouched, bit-for-bit: per-ink isolation AND load-1.0 identity.
+        assert_eq!(full[1].len(), cut[1].len(), "C ribbon count unchanged");
+        for (a, b) in full[1].iter().zip(cut[1].iter()) {
+            assert_eq!(a.pts, b.pts, "C geometry untouched by M's load");
+        }
+    }
+
+    /// The tune loop the GUI relies on: neck width must be monotone non-decreasing
+    /// as load drops, so dragging the slider can never make a sheet more fragile.
+    #[test]
+    fn lower_load_never_worsens_neck() {
+        let (w, h) = (48usize, 48usize);
+        let p = base();
+        let mut prev = 0.0f32;
+        for load in [0.4f32, 0.6, 0.8, 1.0] {
+            let ch = crate::cmyk::Channel {
+                density: vec![0.9; w * h],
+                angle: 0.0,
+                load,
+                display_rgb: [1.0, 0.0, 1.0],
+                name: "M",
+                suffix: "m",
+                tamed: false,
+            };
+            let (_, frag) = render_preview(&[ch], w, h, &p, false);
+            let neck = frag[0].neck_px;
+            if prev > 0.0 {
+                assert!(neck <= prev + 0.01, "neck must not grow with load: {neck} > {prev}");
+            }
+            prev = neck;
+        }
     }
 }

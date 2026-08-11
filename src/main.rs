@@ -1,6 +1,7 @@
 //! Laser halftone vectorizer: raster image -> 4 rotated CMYK halftone SVGs.
 
 mod cmyk;
+mod fragility;
 mod gui;
 mod halftone;
 mod lines;
@@ -56,6 +57,7 @@ struct Args {
     out_prefix: String,
     inks: cmyk::Inks,  // CMYK or extended CMYKOG
     angles: Vec<f32>,  // one screen angle per ink (len == inks.count())
+    loads: Vec<f32>,   // one cut-width scale per ink; 1.0 = full budget (unchanged)
     white_point: f32,  // levels: ink <= this -> white (no stroke)
     black_point: f32,  // levels: ink >= this -> full stroke
     gamma: f32,        // levels: midtone curve
@@ -135,6 +137,24 @@ fn parse_args(skip: usize) -> Result<Args, String> {
             }
             a
         },
+        loads: {
+            let inks = match m.get("inks").map(String::as_str) {
+                Some("cmykog") => cmyk::Inks::Cmykog,
+                _ => cmyk::Inks::Cmyk,
+            };
+            let mut v = inks.default_loads();
+            // --loads 1,0.55,1,1 pulls one heavy ink back so its sheet stays stiff.
+            if let Some(csv) = m.get("loads") {
+                let parsed: Result<Vec<f32>, _> =
+                    csv.split(',').map(|s| s.trim().parse::<f32>()).collect();
+                let parsed = parsed.map_err(|_| "--loads must be comma-separated numbers".to_string())?;
+                if parsed.len() != inks.count() {
+                    return Err(format!("--loads needs {} values for these inks (got {})", inks.count(), parsed.len()));
+                }
+                v = parsed;
+            }
+            v
+        },
         white_point: m.get("white-point").and_then(|s| s.parse().ok()).unwrap_or(0.0),
         black_point: m.get("black-point").and_then(|s| s.parse().ok()).unwrap_or(1.0),
         gamma: m.get("gamma").and_then(|s| s.parse().ok()).unwrap_or(1.0),
@@ -171,6 +191,14 @@ fn run_halftone(skip: usize) -> Result<(), String> {
     ] {
         if v <= 0.0 {
             return Err(format!("--{name} must be > 0 (got {v})"));
+        }
+    }
+    // Two-sided, so it can't fold into the loop above. Reject > 1 rather than clamping:
+    // a load above 1 would silently exceed spacing - min_material and break the
+    // min-material guarantee every shape depends on.
+    for (i, l) in a.loads.iter().enumerate() {
+        if !(0.0..=1.0).contains(l) || *l <= 0.0 {
+            return Err(format!("--loads[{i}] must be in (0,1] (got {l})"));
         }
     }
     if !std::path::Path::new(&a.input).exists() {
@@ -232,6 +260,8 @@ fn run_halftone(skip: usize) -> Result<(), String> {
         black_point: a.black_point,
         gamma: a.gamma,
         scurve: a.scurve,
+        // Placeholder: `generate_all` overwrites this per channel from `Channel::load`.
+        load: 1.0,
         k_mode: if a.k_contour { lines::KMode::Contour } else { lines::KMode::Tonal },
         k_deep_clip: a.k_deep_clip,
         k_gamma: a.k_gamma,
@@ -249,7 +279,7 @@ fn run_halftone(skip: usize) -> Result<(), String> {
         return Err(format!("--margin-mm must be >= 0 (got {})", a.margin_mm));
     }
 
-    let chans = cmyk::channels(&layers, a.inks, &a.angles);
+    let chans = cmyk::channels(&layers, a.inks, &a.angles, &a.loads);
     lines::export(&chans, w_px, h_px, &p, a.auto_levels, a.paper, a.margin_mm, &a.out_prefix)
 }
 
@@ -372,7 +402,7 @@ const USAGE: &str = "usage (all sizes in px; output matches the input image's pi
     halftone --input <img> --spacing-px <f> --min-material-px <f> --min-cut-px <f> \
 [--shape lines|wavy|dots|blue-noise|hatch] [--wave-amp-frac <f>] [--wave-len-frac <f>] [--hatch-bins <n>] \
   [--dot-min-px <f>] [--dot-max-px <f>] \
-[--inks cmyk|cmykog] [--angles 15,75,0,45[,...]] \
+[--inks cmyk|cmykog] [--angles 15,75,0,45[,...]] [--loads 1,0.55,1,1] \
 [--kerf-px <f>] [--bridge-interval-px <f>] [--bridge-px <f>] [--scurve <f>] [--bilateral-px <f>] [--auto-levels on] \
 [--k-mode tonal|contour] [--k-deep-clip <f>] [--k-gamma <f>] [--k-width-frac <f>] [--ucr <f>] [--dog-sigma1 <f>] [--dog-sigma2 <f>] [--dog-threshold <f>] [--paper A2|A3|A4|A5] [--margin-mm <f>] [--out-prefix <s>]\n  \
     stencil  --input <img> --colors <N> \

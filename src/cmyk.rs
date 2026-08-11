@@ -19,6 +19,11 @@ pub struct Layers {
 pub struct Channel {
     pub density: Vec<f32>,
     pub angle: f32,
+    /// Cut-width scale for this ink, in (0,1]. 1.0 = the full cut budget (current
+    /// behaviour). Lower shrinks BOTH this ink's commanded widths and its ceiling, so
+    /// a channel the photo overloads (magenta, usually) can be pulled back until its
+    /// sheet is stiff enough to spray — without touching the other inks.
+    pub load: f32,
     pub display_rgb: [f32; 3],
     pub name: &'static str,
     pub suffix: &'static str,
@@ -57,11 +62,11 @@ impl Inks {
     }
 
     /// Default screen angles (degrees) for each ink, in spec order. CMYK matches the
-    /// classic C15/M75/Y0/K45; O/G reuse spread angles to minimise moiré.
+    /// classic C15/M135/Y0/K45; O/G reuse spread angles to minimise moiré.
     pub fn default_angles(self) -> Vec<f32> {
         match self {
-            Inks::Cmyk => vec![15.0, 75.0, 0.0, 45.0],
-            Inks::Cmykog => vec![15.0, 75.0, 0.0, 30.0, 60.0, 45.0],
+            Inks::Cmyk => vec![15.0, 135.0, 0.0, 45.0],
+            Inks::Cmykog => vec![15.0, 135.0, 0.0, 30.0, 60.0, 45.0],
         }
     }
 
@@ -75,11 +80,12 @@ impl Inks {
     }
 }
 
-/// Build the screened-channel list for an ink set from CMYK layers + per-ink angles.
-/// For `Cmyk` this reproduces the historical C/M/Y/K channels exactly. For `Cmykog`
-/// it splits orange/green out of the CMY (see `split_extended`). `angles.len()` must
-/// match `inks.count()`.
-pub fn channels(layers: &Layers, inks: Inks, angles: &[f32]) -> Vec<Channel> {
+/// Build the screened-channel list for an ink set from CMYK layers + per-ink angles
+/// and cut-width loads. For `Cmyk` this reproduces the historical C/M/Y/K channels
+/// exactly. For `Cmykog` it splits orange/green out of the CMY (see `split_extended`).
+/// `angles.len()` and `loads.len()` must match `inks.count()`; short slices fall back
+/// to per-ink defaults (angle 0, load 1.0 = unchanged output).
+pub fn channels(layers: &Layers, inks: Inks, angles: &[f32], loads: &[f32]) -> Vec<Channel> {
     let specs = inks.specs();
     let maps: Vec<Vec<f32>> = match inks {
         Inks::Cmyk => vec![layers.c.clone(), layers.m.clone(), layers.y.clone(), layers.k.clone()],
@@ -91,12 +97,21 @@ pub fn channels(layers: &Layers, inks: Inks, angles: &[f32]) -> Vec<Channel> {
         .map(|(i, &(name, suffix, rgb, tamed))| Channel {
             density: maps[i].clone(),
             angle: angles.get(i).copied().unwrap_or(0.0),
+            load: loads.get(i).copied().unwrap_or(1.0),
             display_rgb: rgb,
             name,
             suffix,
             tamed,
         })
         .collect()
+}
+
+impl Inks {
+    /// Default per-ink cut-width loads: every ink at full budget, i.e. exactly the
+    /// behaviour before per-ink loads existed.
+    pub fn default_loads(self) -> Vec<f32> {
+        vec![1.0; self.count()]
+    }
 }
 
 /// First-pass RGB→CMYKOG separation heuristic. ponytail: this is an approximation, not

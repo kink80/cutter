@@ -30,6 +30,7 @@ enum Job {
         angles: Vec<f32>,
         auto: bool,
         bilateral_px: f32,
+        loads: Vec<f32>,
     },
     Stencil {
         path: String,
@@ -43,6 +44,8 @@ struct Rendered {
     w: usize,
     h: usize,
     rgb: Vec<u8>, // w*h*3
+    /// Per-layer stiffness: (layer name, readout). Drives the STIFFNESS panel.
+    frag: Vec<(String, crate::fragility::Fragility)>,
 }
 
 pub fn run() -> Result<(), String> {
@@ -125,6 +128,8 @@ struct App {
     margin_mm: f32,
     inks: cmyk::Inks,       // CMYK or extended CMYKOG
     angles: Vec<f32>,       // one screen angle per ink (len == inks.count())
+    angles_locked: bool,    // drag one angle, all rotate by the same delta
+    loads: Vec<f32>,        // one cut-width scale per ink; 1.0 = full budget
     white_point: f32,
     black_point: f32,
     gamma: f32,
@@ -146,6 +151,8 @@ struct App {
 
     // preview / worker
     texture: Option<egui::TextureHandle>,
+    /// Latest per-layer stiffness readout, from the most recent render.
+    frag: Vec<(String, crate::fragility::Fragility)>,
     dirty: bool,
     in_flight: bool,
     to_worker: mpsc::Sender<Job>,
@@ -169,22 +176,24 @@ impl App {
                     job = newer;
                 }
                 let rendered = match job {
-                    Job::Halftone { path, layers, w, h, p, inks, angles, auto, bilateral_px } => {
+                    Job::Halftone { path, layers, w, h, p, inks, angles, auto, bilateral_px, loads } => {
                         // Reload with the edge-preserving pre-filter only when it's on
                         // (it's slow); otherwise reuse the cached, unfiltered layers.
-                        let buf = if bilateral_px > 0.0 {
+                        let names = inks.names();
+                        let (buf, frag) = if bilateral_px > 0.0 {
                             match cmyk::load_filtered(&path, w, h, bilateral_px) {
                                 Ok(l) => {
-                                    let chans = cmyk::channels(&l, inks, &angles);
+                                    let chans = cmyk::channels(&l, inks, &angles, &loads);
                                     lines::render_preview(&chans, w, h, &p, auto)
                                 }
                                 Err(_) => continue,
                             }
                         } else {
-                            let chans = cmyk::channels(&layers, inks, &angles);
+                            let chans = cmyk::channels(&layers, inks, &angles, &loads);
                             lines::render_preview(&chans, w, h, &p, auto)
                         };
-                        Rendered { w, h, rgb: buf.into_raw() }
+                        let frag = names.iter().map(|n| n.to_string()).zip(frag).collect();
+                        Rendered { w, h, rgb: buf.into_raw(), frag }
                     }
                     Job::Stencil { path, w, h, p } => {
                         // ponytail: stencil reloads from disk each frame (quantize is
@@ -192,8 +201,18 @@ impl App {
                         // guaranteed the path exists.
                         match stencil::stencil_masks(&path, w, h, &p, &mut |_| {}) {
                             Ok((palette, masks)) => {
+                                // Stencil masks are already keep-polarity (true = the
+                                // material this layer keeps), unlike halftone's cut
+                                // masks — measure them directly, no inversion.
+                                let frag = masks
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, m)| {
+                                        (format!("{i}"), crate::fragility::measure(m, w, h))
+                                    })
+                                    .collect();
                                 let buf = stencil::preview(&palette, &masks, w, h);
-                                Rendered { w, h, rgb: buf.into_raw() }
+                                Rendered { w, h, rgb: buf.into_raw(), frag }
                             }
                             // On error just skip the frame; status stays as-is.
                             Err(_) => continue,
@@ -235,6 +254,8 @@ impl App {
             margin_mm: 10.0,
             inks: cmyk::Inks::Cmyk,
             angles: cmyk::Inks::Cmyk.default_angles(),
+            angles_locked: false,
+            loads: cmyk::Inks::Cmyk.default_loads(),
             white_point: 0.0,
             black_point: 1.0,
             gamma: 1.0,
@@ -250,6 +271,7 @@ impl App {
             dims: (0, 0),
             status: "Open an image to begin".into(),
             texture: None,
+            frag: Vec::new(),
             dirty: false,
             in_flight: false,
             to_worker,
@@ -307,6 +329,8 @@ impl App {
             black_point: self.black_point,
             gamma: self.gamma,
             scurve: self.scurve,
+            // Placeholder: `generate_all` overwrites this per channel from `Channel::load`.
+            load: 1.0,
             k_mode: if self.k_contour { crate::lines::KMode::Contour } else { crate::lines::KMode::Tonal },
             k_deep_clip: self.k_deep_clip,
             k_gamma: self.k_gamma,
@@ -345,6 +369,7 @@ impl App {
                 angles: self.angles.clone(),
                 auto: self.auto_levels,
                 bilateral_px: self.bilateral_px,
+                loads: self.loads.clone(),
             }),
             Mode::Stencil => Some(Job::Stencil {
                 path: self.path.clone()?,
@@ -376,6 +401,7 @@ impl App {
         let sp = self.stencil_params();
         let inks = self.inks;
         let angles = self.angles.clone();
+        let loads = self.loads.clone();
         let auto = self.auto_levels;
         let smooth = self.smooth_px;
         let bilateral_px = self.bilateral_px;
@@ -398,7 +424,7 @@ impl App {
                     } else {
                         layers.as_ref().unwrap().as_ref()
                     };
-                    let chans = cmyk::channels(l, inks, &angles);
+                    let chans = cmyk::channels(l, inks, &angles, &loads);
                     lines::export(&chans, w, h, &hp, auto, paper, margin_mm, &prefix)
                 }
                 Mode::Stencil => stencil::export(
@@ -419,6 +445,7 @@ impl eframe::App for App {
         if let Ok(r) = self.from_worker.try_recv() {
             let img = egui::ColorImage::from_rgb([r.w, r.h], &r.rgb);
             self.texture = Some(ctx.load_texture("preview", img, egui::TextureOptions::LINEAR));
+            self.frag = r.frag;
             self.in_flight = false;
         }
         // Pick up a finished generate.
@@ -497,6 +524,48 @@ impl eframe::App for App {
                 });
             };
 
+            // STIFFNESS first: a heavily-cut sheet turns into a floppy lattice that
+            // lifts and bleeds when sprayed, and the preview can't show that. Sits
+            // above the sliders so it stays visible while they're being dragged.
+            if !self.frag.is_empty() {
+                // Snapshot: the section closure needs &mut ui while self.frag is borrowed.
+                let rows: Vec<(String, f32, f32)> = self
+                    .frag
+                    .iter()
+                    .map(|(n, f)| (n.clone(), f.removed, f.neck_px))
+                    .collect();
+                section(ui, "STIFFNESS", &mut |ui| {
+                    for (name, removed, neck) in &rows {
+                        // ponytail: 2px/1px are placeholders — the honest threshold
+                        // depends on material and kerf. They rank layers against each
+                        // other correctly, which is what tuning needs. Upgrade path:
+                        // derive from min_material_px and the sheet scale.
+                        let col = if *neck >= 2.0 {
+                            egui::Color32::from_gray(0x8A)
+                        } else if *neck >= 1.0 {
+                            egui::Color32::from_rgb(0xE0, 0xA0, 0x30)
+                        } else {
+                            egui::Color32::from_rgb(0xE0, 0x3A, 0x2F)
+                        };
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{:<8} cut {:>3.0}%   neck {:>4.1}px",
+                                name,
+                                removed * 100.0,
+                                neck
+                            ))
+                            .monospace()
+                            .color(col),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new("neck = thinnest standing material; under 1px is lace")
+                            .small()
+                            .weak(),
+                    );
+                });
+            }
+
             match self.mode {
                 Mode::Halftone => {
                     use crate::lines::Shape;
@@ -568,22 +637,60 @@ impl eframe::App for App {
                         });
                         if new_inks != self.inks {
                             // Reset angles to the new preset's defaults (resizes the vec).
+                            // Loads reset too: CMYKOG's magenta has already had orange
+                            // pulled out of it, so a load tuned for CMYK's M no longer
+                            // applies to the same ink.
                             self.inks = new_inks;
                             self.angles = new_inks.default_angles();
+                            self.loads = new_inks.default_loads();
                             ch = true;
                         }
                     });
                     section(ui, "ANGLES", &mut |ui| {
                         let names = self.inks.names();
+                        ui.checkbox(&mut self.angles_locked, "lock (move together)");
                         for i in 0..self.angles.len() {
+                            let before = self.angles[i];
                             s(ui, &mut ch, &mut self.angles[i], 0.0, 180.0, names[i]);
+                            if self.angles_locked {
+                                // Screens repeat every 180 deg, so shift all inks by the
+                                // same delta and wrap - relative spacing is what matters.
+                                let d = self.angles[i] - before;
+                                if d != 0.0 {
+                                    for (j, a) in self.angles.iter_mut().enumerate() {
+                                        if j != i {
+                                            *a = (*a + d).rem_euclid(180.0);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    section(ui, "INK LOAD", &mut |ui| {
+                        // A magenta-heavy photo overloads one sheet while the rest stay
+                        // sparse. Pull that ink back until its STIFFNESS row goes grey.
+                        // Capped at 1.0: above it, cuts would exceed spacing - min
+                        // material and break the guarantee every shape relies on.
+                        let names = self.inks.names();
+                        for i in 0..self.loads.len() {
+                            s(ui, &mut ch, &mut self.loads[i], 0.2, 1.0, names[i]);
+                        }
+                        ui.label(
+                            egui::RichText::new("1.0 = full cut budget; lower = stiffer sheet")
+                                .small()
+                                .weak(),
+                        );
+                        if self.inks.names().last() == Some(&"Black") {
+                            ui.label(
+                                egui::RichText::new("(black uses K width, below)").small().weak(),
+                            );
                         }
                     });
                     let auto_cp = if self.auto_levels {
                         self.layers.as_ref().map(|l| {
                             // Per-channel clip points for the current ink set (tamed inks
                             // bake their own tone, so only untamed ones auto-level).
-                            cmyk::channels(l, self.inks, &self.angles).into_iter()
+                            cmyk::channels(l, self.inks, &self.angles, &self.loads).into_iter()
                                 .filter(|c| !c.tamed)
                                 .map(|c| {
                                     let (wp, bp) = crate::halftone::auto_levels(&c.density, 0.005, 0.995);
