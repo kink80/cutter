@@ -98,6 +98,7 @@ fn parse_args(skip: usize) -> Result<Args, String> {
         shape_params: lines::ShapeParams {
             wave_amp_frac: m.get("wave-amp-frac").and_then(|s| s.parse().ok()).unwrap_or(0.35),
             wave_len_frac: m.get("wave-len-frac").and_then(|s| s.parse().ok()).unwrap_or(4.0),
+            wave_width_frac: m.get("wave-width-frac").and_then(|s| s.parse().ok()).unwrap_or(1.0),
             hatch_bins: m.get("hatch-bins").and_then(|s| s.parse().ok()).unwrap_or(6),
             // BlueNoise dot size range; default INFINITY => fixed cut-safe size (FM).
             dot_min_px: m.get("dot-min-px").and_then(|s| s.parse().ok()).unwrap_or(f32::INFINITY),
@@ -400,7 +401,7 @@ fn run_stencil(skip: usize) -> Result<(), String> {
 const USAGE: &str = "usage (all sizes in px; output matches the input image's pixel dimensions):\n  \
     gui\n  \
     halftone --input <img> --spacing-px <f> --min-material-px <f> --min-cut-px <f> \
-[--shape lines|wavy|dots|blue-noise|hatch] [--wave-amp-frac <f>] [--wave-len-frac <f>] [--hatch-bins <n>] \
+[--shape lines|wavy|dots|blue-noise|hatch] [--wave-amp-frac <f>] [--wave-len-frac <f>] [--wave-width-frac <f>] [--hatch-bins <n>] \
   [--dot-min-px <f>] [--dot-max-px <f>] \
 [--inks cmyk|cmykog] [--angles 15,75,0,45[,...]] [--loads 1,0.55,1,1] \
 [--kerf-px <f>] [--bridge-interval-px <f>] [--bridge-px <f>] [--scurve <f>] [--bilateral-px <f>] [--auto-levels on] \

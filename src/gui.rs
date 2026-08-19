@@ -105,6 +105,7 @@ struct App {
     shape: crate::lines::Shape,
     wave_amp_frac: f32,
     wave_len_frac: f32,
+    wave_width_frac: f32,
     hatch_bins: u32,
     bn_dot_min_px: f32,
     bn_dot_max_px: f32,
@@ -229,6 +230,7 @@ impl App {
             shape: crate::lines::Shape::Lines,
             wave_amp_frac: 0.35,
             wave_len_frac: 4.0,
+            wave_width_frac: 0.6,
             hatch_bins: 6,
             // Blue-noise dot size range. Default both = spacing -> both clamp to the
             // cut-safe radius -> fixed-size FM (original look). Drop min for AM detail.
@@ -282,6 +284,222 @@ impl App {
         }
     }
 
+    /// Serialize every knob to a simple `key = value` text preset (dependency-free,
+    /// same plain-text spirit as the palette files). Runtime/worker state and the
+    /// loaded image are intentionally excluded — a preset is just the settings.
+    fn preset_string(&self) -> String {
+        use std::fmt::Write as _;
+        let shape = match self.shape {
+            crate::lines::Shape::Lines => "lines",
+            crate::lines::Shape::Wavy => "wavy",
+            crate::lines::Shape::Dots => "dots",
+            crate::lines::Shape::BlueNoise => "blue-noise",
+            crate::lines::Shape::Hatch => "hatch",
+        };
+        let inks = match self.inks {
+            cmyk::Inks::Cmyk => "cmyk",
+            cmyk::Inks::Cmykog => "cmykog",
+        };
+        let paper = match self.paper {
+            None => "none".to_string(),
+            Some(crate::svg::Paper::A2) => "a2".into(),
+            Some(crate::svg::Paper::A3) => "a3".into(),
+            Some(crate::svg::Paper::A4) => "a4".into(),
+            Some(crate::svg::Paper::A5) => "a5".into(),
+        };
+        let mode = if self.mode == Mode::Stencil { "stencil" } else { "halftone" };
+        let csv = |v: &[f32]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
+        let mut s = String::new();
+        let _ = writeln!(s, "# laser_halftone preset v1");
+        let _ = writeln!(s, "mode = {mode}");
+        let _ = writeln!(s, "# --- halftone ---");
+        let _ = writeln!(s, "shape = {shape}");
+        let _ = writeln!(s, "wave_amp_frac = {}", self.wave_amp_frac);
+        let _ = writeln!(s, "wave_len_frac = {}", self.wave_len_frac);
+        let _ = writeln!(s, "wave_width_frac = {}", self.wave_width_frac);
+        let _ = writeln!(s, "hatch_bins = {}", self.hatch_bins);
+        let _ = writeln!(s, "bn_dot_min_px = {}", self.bn_dot_min_px);
+        let _ = writeln!(s, "bn_dot_max_px = {}", self.bn_dot_max_px);
+        let _ = writeln!(s, "spacing_px = {}", self.spacing_px);
+        let _ = writeln!(s, "min_material_px = {}", self.min_material_px);
+        let _ = writeln!(s, "min_cut_px = {}", self.min_cut_px);
+        let _ = writeln!(s, "kerf_px = {}", self.kerf_px);
+        let _ = writeln!(s, "bridge_interval_px = {}", self.bridge_interval_px);
+        let _ = writeln!(s, "ht_bridge_px = {}", self.ht_bridge_px);
+        let _ = writeln!(s, "scurve = {}", self.scurve);
+        let _ = writeln!(s, "bilateral_px = {}", self.bilateral_px);
+        let _ = writeln!(s, "k_contour = {}", self.k_contour);
+        let _ = writeln!(s, "k_deep_clip = {}", self.k_deep_clip);
+        let _ = writeln!(s, "k_gamma = {}", self.k_gamma);
+        let _ = writeln!(s, "k_width_frac = {}", self.k_width_frac);
+        let _ = writeln!(s, "ucr = {}", self.ucr);
+        let _ = writeln!(s, "dog_sigma1 = {}", self.dog_sigma1);
+        let _ = writeln!(s, "dog_sigma2 = {}", self.dog_sigma2);
+        let _ = writeln!(s, "dog_threshold = {}", self.dog_threshold);
+        let _ = writeln!(s, "paper = {paper}");
+        let _ = writeln!(s, "margin_mm = {}", self.margin_mm);
+        let _ = writeln!(s, "inks = {inks}");
+        let _ = writeln!(s, "angles = {}", csv(&self.angles));
+        let _ = writeln!(s, "angles_locked = {}", self.angles_locked);
+        let _ = writeln!(s, "loads = {}", csv(&self.loads));
+        let _ = writeln!(s, "white_point = {}", self.white_point);
+        let _ = writeln!(s, "black_point = {}", self.black_point);
+        let _ = writeln!(s, "gamma = {}", self.gamma);
+        let _ = writeln!(s, "auto_levels = {}", self.auto_levels);
+        let _ = writeln!(s, "# --- stencil ---");
+        let _ = writeln!(s, "colors = {}", self.colors);
+        let _ = writeln!(s, "coarsen_px = {}", self.coarsen_px);
+        let _ = writeln!(s, "min_feature_px = {}", self.min_feature_px);
+        let _ = writeln!(s, "bridges = {}", self.bridges);
+        let _ = writeln!(s, "bridge_px = {}", self.bridge_px);
+        let _ = writeln!(s, "smooth_px = {}", self.smooth_px);
+        s
+    }
+
+    /// Apply a preset text over the current knobs. Unknown/missing keys keep their
+    /// current value (forward/backward compatible), and out-of-range vectors fall
+    /// back to the ink defaults so a mismatched `inks`/`angles` pair can't panic.
+    fn apply_preset(&mut self, text: &str) {
+        let map: std::collections::HashMap<String, String> = text
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                if l.is_empty() || l.starts_with('#') {
+                    return None;
+                }
+                let (k, v) = l.split_once('=')?;
+                Some((k.trim().to_string(), v.trim().to_string()))
+            })
+            .collect();
+        let f = |k: &str, cur: f32| map.get(k).and_then(|s| s.parse().ok()).unwrap_or(cur);
+        let u = |k: &str, cur: u32| map.get(k).and_then(|s| s.parse().ok()).unwrap_or(cur);
+        let b = |k: &str, cur: bool| map.get(k).and_then(|s| s.parse().ok()).unwrap_or(cur);
+
+        if let Some(v) = map.get("mode") {
+            self.mode = if v == "stencil" { Mode::Stencil } else { Mode::Halftone };
+        }
+        if let Some(v) = map.get("shape") {
+            use crate::lines::Shape::*;
+            self.shape = match v.as_str() {
+                "lines" => Lines,
+                "wavy" => Wavy,
+                "dots" => Dots,
+                "blue-noise" => BlueNoise,
+                "hatch" => Hatch,
+                _ => self.shape,
+            };
+        }
+        self.wave_amp_frac = f("wave_amp_frac", self.wave_amp_frac);
+        self.wave_len_frac = f("wave_len_frac", self.wave_len_frac);
+        self.wave_width_frac = f("wave_width_frac", self.wave_width_frac);
+        self.hatch_bins = u("hatch_bins", self.hatch_bins);
+        self.bn_dot_min_px = f("bn_dot_min_px", self.bn_dot_min_px);
+        self.bn_dot_max_px = f("bn_dot_max_px", self.bn_dot_max_px);
+        self.spacing_px = f("spacing_px", self.spacing_px);
+        self.min_material_px = f("min_material_px", self.min_material_px);
+        self.min_cut_px = f("min_cut_px", self.min_cut_px);
+        self.kerf_px = f("kerf_px", self.kerf_px);
+        self.bridge_interval_px = f("bridge_interval_px", self.bridge_interval_px);
+        self.ht_bridge_px = f("ht_bridge_px", self.ht_bridge_px);
+        self.scurve = f("scurve", self.scurve);
+        self.bilateral_px = f("bilateral_px", self.bilateral_px);
+        self.k_contour = b("k_contour", self.k_contour);
+        self.k_deep_clip = f("k_deep_clip", self.k_deep_clip);
+        self.k_gamma = f("k_gamma", self.k_gamma);
+        self.k_width_frac = f("k_width_frac", self.k_width_frac);
+        self.ucr = f("ucr", self.ucr);
+        self.dog_sigma1 = f("dog_sigma1", self.dog_sigma1);
+        self.dog_sigma2 = f("dog_sigma2", self.dog_sigma2);
+        self.dog_threshold = f("dog_threshold", self.dog_threshold);
+        if let Some(v) = map.get("paper") {
+            use crate::svg::Paper::*;
+            self.paper = match v.as_str() {
+                "a2" => Some(A2),
+                "a3" => Some(A3),
+                "a4" => Some(A4),
+                "a5" => Some(A5),
+                _ => None,
+            };
+        }
+        self.margin_mm = f("margin_mm", self.margin_mm);
+        // Inks first, then angles/loads (their length must match the ink count).
+        if let Some(v) = map.get("inks") {
+            self.inks = match v.as_str() {
+                "cmykog" => cmyk::Inks::Cmykog,
+                _ => cmyk::Inks::Cmyk,
+            };
+        }
+        let parse_vec = |s: &str| -> Vec<f32> {
+            s.split(',').filter_map(|x| x.trim().parse().ok()).collect()
+        };
+        if let Some(v) = map.get("angles") {
+            let a = parse_vec(v);
+            if a.len() == self.inks.count() {
+                self.angles = a;
+            }
+        }
+        if let Some(v) = map.get("loads") {
+            let l = parse_vec(v);
+            if l.len() == self.inks.count() {
+                self.loads = l;
+            }
+        }
+        // Guarantee the vectors match the ink count even if the preset omitted them
+        // or switched inks without listing new angles/loads.
+        if self.angles.len() != self.inks.count() {
+            self.angles = self.inks.default_angles();
+        }
+        if self.loads.len() != self.inks.count() {
+            self.loads = self.inks.default_loads();
+        }
+        self.angles_locked = b("angles_locked", self.angles_locked);
+        self.white_point = f("white_point", self.white_point);
+        self.black_point = f("black_point", self.black_point);
+        self.gamma = f("gamma", self.gamma);
+        self.auto_levels = b("auto_levels", self.auto_levels);
+        self.colors = map.get("colors").and_then(|s| s.parse().ok()).unwrap_or(self.colors);
+        self.coarsen_px = f("coarsen_px", self.coarsen_px);
+        self.min_feature_px = f("min_feature_px", self.min_feature_px);
+        self.bridges = b("bridges", self.bridges);
+        self.bridge_px = f("bridge_px", self.bridge_px);
+        self.smooth_px = f("smooth_px", self.smooth_px);
+        self.dirty = true;
+    }
+
+    /// Prompt for a `.preset` file and write the current settings to it.
+    fn save_preset(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("preset", &["preset", "txt"])
+            .set_file_name("laser_halftone.preset")
+            .save_file()
+        else {
+            return;
+        };
+        let path = path.display().to_string();
+        match std::fs::write(&path, self.preset_string()) {
+            Ok(()) => self.status = format!("saved preset {path}"),
+            Err(e) => self.status = format!("save preset {path}: {e}"),
+        }
+    }
+
+    /// Prompt for a `.preset` file and apply it over the current settings.
+    fn load_preset(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("preset", &["preset", "txt"])
+            .pick_file()
+        else {
+            return;
+        };
+        let path = path.display().to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                self.apply_preset(&text);
+                self.status = format!("loaded preset {path}");
+            }
+            Err(e) => self.status = format!("load preset {path}: {e}"),
+        }
+    }
+
     fn open_image(&mut self) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("image", &["png", "jpg", "jpeg", "webp", "bmp"])
@@ -315,6 +533,7 @@ impl App {
             shape_params: crate::lines::ShapeParams {
                 wave_amp_frac: self.wave_amp_frac,
                 wave_len_frac: self.wave_len_frac,
+                wave_width_frac: self.wave_width_frac,
                 hatch_bins: self.hatch_bins,
                 dot_min_px: self.bn_dot_min_px,
                 dot_max_px: self.bn_dot_max_px,
@@ -497,6 +716,16 @@ impl eframe::App for App {
             if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Open image…")).clicked() {
                 self.open_image();
             }
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let w = (ui.available_width() - ui.spacing().item_spacing.x) / 2.0;
+                if ui.add_sized([w, 24.0], egui::Button::new("Save preset…")).clicked() {
+                    self.save_preset();
+                }
+                if ui.add_sized([w, 24.0], egui::Button::new("Load preset…")).clicked() {
+                    self.load_preset();
+                }
+            });
             ui.add_space(8.0);
 
             // Mode toggle.
@@ -592,6 +821,7 @@ impl eframe::App for App {
                         if self.shape == Shape::Wavy {
                             s(ui, &mut ch, &mut self.wave_amp_frac, 0.0, 0.5, "wave amp (× pitch)");
                             s(ui, &mut ch, &mut self.wave_len_frac, 1.0, 12.0, "wave length (× pitch)");
+                            s(ui, &mut ch, &mut self.wave_width_frac, 0.1, 1.0, "colour line width (× pitch)");
                         }
                         if self.shape == Shape::Hatch {
                             let mut bins = self.hatch_bins as f32;
@@ -816,5 +1046,77 @@ impl eframe::App for App {
         if self.in_flight || self.generating {
             ctx.request_repaint();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preset_round_trips_every_knob() {
+        // Mutate a representative slice of knobs (scalars, bools, an enum, the ink
+        // set + its angle/load vectors, paper, mode), serialize, then apply onto a
+        // fresh App and confirm every value survived the text round-trip.
+        let mut a = App::new();
+        a.mode = Mode::Stencil;
+        a.shape = crate::lines::Shape::Wavy;
+        a.wave_amp_frac = 0.42;
+        a.wave_width_frac = 0.37;
+        a.spacing_px = 12.5;
+        a.min_material_px = 1.75;
+        a.k_contour = true;
+        a.auto_levels = true;
+        a.paper = Some(crate::svg::Paper::A3);
+        a.inks = cmyk::Inks::Cmykog;
+        a.angles = a.inks.default_angles();
+        a.loads = a.inks.default_loads();
+        a.angles[0] = 33.0;
+        a.loads[1] = 0.5;
+        a.colors = 7;
+
+        let text = a.preset_string();
+        let mut b = App::new();
+        assert_ne!(b.spacing_px, a.spacing_px, "fresh App differs before apply");
+        b.apply_preset(&text);
+
+        assert!(b.mode == a.mode);
+        assert!(b.shape == a.shape);
+        assert_eq!(b.wave_amp_frac, a.wave_amp_frac);
+        assert_eq!(b.wave_width_frac, a.wave_width_frac);
+        assert_eq!(b.spacing_px, a.spacing_px);
+        assert_eq!(b.min_material_px, a.min_material_px);
+        assert_eq!(b.k_contour, a.k_contour);
+        assert_eq!(b.auto_levels, a.auto_levels);
+        assert!(b.paper == a.paper);
+        assert!(b.inks == a.inks);
+        assert_eq!(b.angles, a.angles);
+        assert_eq!(b.loads, a.loads);
+        assert_eq!(b.colors, a.colors);
+        assert!(b.dirty, "loading a preset marks the preview dirty");
+    }
+
+    #[test]
+    fn apply_preset_keeps_current_on_missing_or_bad_keys() {
+        let mut a = App::new();
+        let before = a.spacing_px;
+        // Unknown key ignored; bad value falls back to the current field.
+        a.apply_preset("nonsense_key = 5
+spacing_px = not_a_number
+");
+        assert_eq!(a.spacing_px, before);
+    }
+
+    #[test]
+    fn apply_preset_fixes_mismatched_ink_vectors() {
+        // Switching to cmykog but giving 4-length angles must not stick a bad-length
+        // vector on the App — it falls back to the ink defaults (len == count).
+        let mut a = App::new();
+        a.apply_preset("inks = cmykog
+angles = 15,75,0,45
+");
+        assert!(a.inks == cmyk::Inks::Cmykog);
+        assert_eq!(a.angles.len(), a.inks.count());
+        assert_eq!(a.loads.len(), a.inks.count());
     }
 }

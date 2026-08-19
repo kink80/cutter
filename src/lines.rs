@@ -13,8 +13,9 @@
 //!                 slot by K_laser so the *resulting* gap matches the target width.
 //!
 //! Continuous cut lines are broken by physical bridges every `bridge_interval`,
-//! and bridges on adjacent lines are staggered by half the interval so they form a
-//! hexagonal lattice (PDF "Secret Sauce #1") that keeps the sheet flat.
+//! and each line's bridge phase is offset by a golden-ratio fraction of the interval
+//! (see `bridge_phase`) so tabs on neighbouring lines interleave instead of aligning
+//! into "rivers" — a river-free lattice that keeps the sheet flat.
 
 
 /// How the K (black) channel is generated. Black spray paint is 100% opaque, so
@@ -57,6 +58,13 @@ pub enum Shape {
 pub struct ShapeParams {
     pub wave_amp_frac: f32,   // Wavy: amplitude as a fraction of spacing
     pub wave_len_frac: f32,   // Wavy: wavelength as a multiple of spacing
+    // Wavy: cap the cut width of the TRANSLUCENT (CMY…) channels to this fraction of
+    // spacing so a visible wave has room to swing. Full-pitch CMY cuts leave no gap
+    // between neighbouring lines, so the amplitude clamp in `generate_wavy` forces
+    // them nearly straight — only the thin tamed K waved. Lowering this thins the
+    // colour lines (less coverage) in exchange for a real wobble on every ink. 1.0 =
+    // no extra cap (old behaviour: only K waves).
+    pub wave_width_frac: f32,
     pub hatch_bins: u32,      // Hatch: number of orientation bins over 180°
     // BlueNoise: dot DIAMETER range (px). Size scales with local tone between these,
     // so darkness drives size (AM) on top of frequency (FM). Both clamped cut-safe
@@ -71,6 +79,7 @@ impl Default for ShapeParams {
         ShapeParams {
             wave_amp_frac: 0.35,
             wave_len_frac: 4.0,
+            wave_width_frac: 1.0, // no extra cap; opt-in via GUI/CLI so waves reach CMY
             hatch_bins: 6,
             dot_min_px: f32::INFINITY,
             dot_max_px: f32::INFINITY,
@@ -265,13 +274,13 @@ fn generate_quads_prox(
 
     for li in -n_lines..=n_lines {
         let u = li as f32 * p.spacing_px;
-        // Staggered hex lattice: shift every other line's bridge phase by half the
-        // interval, so bridges never line up across adjacent lines.
-        let bridge_phase = if li.rem_euclid(2) == 0 {
-            0.0
-        } else {
-            p.bridge_interval_px * 0.5
-        };
+        // Interleaved bridge lattice: offset each line's bridge phase by a golden-
+        // ratio fraction of the interval. A 2-phase stagger only hides rivers on
+        // every-other line (0,2,4… share a tab column, 1,3,5… the other), so tabs
+        // still queue into diagonal channels. The low-discrepancy phase never
+        // repeats, so consecutive lines never realign and each tab is flanked by
+        // open cut on both neighbours — no bridge rivers. See `bridge_phase`.
+        let bridge_phase = bridge_phase(li, p.bridge_interval_px);
 
         // Accumulate a maximal RUN of consecutive cut segments on this line, then
         // flush the whole run as one ribbon. `run` holds (v_position, half_width)
@@ -399,6 +408,20 @@ fn max_cut_for(p: &LineParams) -> f32 {
     (p.spacing_px - p.min_material_px).max(0.0)
 }
 
+/// Along-line phase offset for one screen line's bridge tabs, in px.
+///
+/// The old scheme used only two phases (even lines at 0, odd lines at half the
+/// interval). With just two phases the pattern repeats every other line, so tabs
+/// queue into two diagonal "rivers" of aligned standing material. Instead we scatter
+/// the phase by the golden-ratio conjugate `frac(1/φ) ≈ 0.618`, a low-discrepancy
+/// sequence: consecutive lines are always well separated, the offset never repeats
+/// with a short period, and every tab lands over open cut on both neighbours — an
+/// interleaved, river-free bridge lattice.
+fn bridge_phase(li: i32, interval: f32) -> f32 {
+    const INV_PHI: f32 = 0.618_034;
+    (li as f32 * INV_PHI).rem_euclid(1.0) * interval
+}
+
 /// Screen one density map into ribbons using the selected shape. This is the single
 /// funnel every channel goes through (CMY and the tamed K), so a shape swap changes
 /// only HOW the map becomes geometry — never how the K map was computed, nor
@@ -449,7 +472,7 @@ fn generate_wavy(
     let mut ribbons = Vec::new();
     for li in -n_lines..=n_lines {
         let u = li as f32 * p.spacing_px;
-        let bridge_phase = if li.rem_euclid(2) == 0 { 0.0 } else { p.bridge_interval_px * 0.5 };
+        let bridge_phase = bridge_phase(li, p.bridge_interval_px);
         // A run of (canvas_x, canvas_y, half_width) knots along the wavy centerline.
         let mut run: Vec<(f32, f32, f32)> = Vec::new();
         let mut v = -half_span;
@@ -880,7 +903,14 @@ pub fn generate_all(
                     LineParams { load: ch.load, ..*p }
                 };
                 // Scale the ceiling by the same factor as the ramp in `cut_extent`.
-                generate_shape(&ch.density, w, h, ch.angle, &cp, max_cut_for(&cp) * ch.load)
+                let mut cap = max_cut_for(&cp) * ch.load;
+                // In Wavy mode, cap the translucent inks' cut width so there's room
+                // between neighbouring lines for the wave to swing (see
+                // `wave_width_frac`); a full-pitch cut pins the amplitude near zero.
+                if matches!(cp.shape, Shape::Wavy) {
+                    cap = cap.min(cp.shape_params.wave_width_frac * cp.spacing_px);
+                }
+                generate_shape(&ch.density, w, h, ch.angle, &cp, cap)
             }
         })
         .collect()
@@ -1167,6 +1197,30 @@ mod tests {
         // But still coalesced: far fewer than segment-per-quad (v_step=4 over 200px
         // ~= 50 segments/line * ~20 lines = ~1000). Bridged run count is a fraction.
         assert!(r.len() < 400, "runs stay coalesced, got {}", r.len());
+    }
+
+    #[test]
+    fn bridge_phases_interleave_without_rivers() {
+        // The 2-phase stagger repeated every other line, so any three consecutive
+        // lines had two with an identical bridge phase -> tabs aligned into rivers.
+        // The golden-ratio phase must keep every pair of consecutive lines well
+        // separated and never realign three lines in a row.
+        let interval = 20.0f32;
+        let tab = 4.0f32; // bridge_px
+        let phases: Vec<f32> = (-50..=50).map(|li| bridge_phase(li, interval)).collect();
+        // Circular distance on [0,interval).
+        let dist = |a: f32, b: f32| {
+            let d = (a - b).rem_euclid(interval);
+            d.min(interval - d)
+        };
+        for w in phases.windows(3) {
+            // No two consecutive lines share (nearly) the same phase -> their tabs
+            // don't stack. Require at least a full tab width of separation.
+            assert!(dist(w[0], w[1]) >= tab, "adjacent lines must not align tabs: {} vs {}", w[0], w[1]);
+            assert!(dist(w[1], w[2]) >= tab, "adjacent lines must not align tabs: {} vs {}", w[1], w[2]);
+            // And a 2-phase pattern would make line i and i+2 identical: forbid it.
+            assert!(dist(w[0], w[2]) >= tab, "no 2-phase river: line i and i+2 realign: {} vs {}", w[0], w[2]);
+        }
     }
 
     #[test]
