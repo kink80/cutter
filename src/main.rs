@@ -8,6 +8,7 @@ mod lines;
 mod smooth;
 mod stencil;
 mod svg;
+mod warp;
 
 use std::collections::HashMap;
 

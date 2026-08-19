@@ -17,6 +17,32 @@ enum Mode {
     Stencil,
 }
 
+/// Central panel view: the processed cut preview, or the original photo with the
+/// crop + perspective editing overlay.
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    Preview,
+    Original,
+}
+
+/// Which editing overlay is active in the Original view.
+#[derive(Clone, Copy, PartialEq)]
+enum EditTool {
+    Crop,
+    Perspective,
+}
+
+/// What the pointer is currently dragging in the Original view. Crop corners are
+/// TL,TR,BR,BL (0..3); crop edges are top,right,bottom,left (0..3); perspective
+/// corners are TL,TR,BR,BL (0..3).
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    CropCorner(usize),
+    CropEdge(usize),
+    CropBody,
+    Persp(usize),
+}
+
 /// A snapshot of every knob, sent to the worker to render one preview frame.
 #[derive(Clone)]
 enum Job {
@@ -144,11 +170,23 @@ struct App {
     bridge_px: f32,
     smooth_px: f32,
 
-    // loaded image
+    // loaded image (working = crop/warp-baked; orig = the file the user picked)
     path: Option<String>,
     layers: Option<Arc<cmyk::Layers>>,
     dims: (usize, usize),
     status: String,
+
+    // original photo + crop/perspective editing
+    view: View,
+    edit_tool: EditTool,
+    orig_path: Option<String>,
+    orig_dims: (usize, usize),
+    orig_texture: Option<egui::TextureHandle>,
+    crop_min: [f32; 2], // normalized [0,1] top-left of the crop rectangle
+    crop_max: [f32; 2], // normalized [0,1] bottom-right of the crop rectangle
+    persp: [[f32; 2]; 4], // normalized source-quad corners TL,TR,BR,BL for dewarp
+    drag: Option<Drag>,
+    work_tmp: Option<String>, // last baked temp file, deleted before the next bake
 
     // preview / worker
     texture: Option<egui::TextureHandle>,
@@ -272,6 +310,16 @@ impl App {
             layers: None,
             dims: (0, 0),
             status: "Open an image to begin".into(),
+            view: View::Preview,
+            edit_tool: EditTool::Crop,
+            orig_path: None,
+            orig_dims: (0, 0),
+            orig_texture: None,
+            crop_min: [0.0, 0.0],
+            crop_max: [1.0, 1.0],
+            persp: [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            drag: None,
+            work_tmp: None,
             texture: None,
             frag: Vec::new(),
             dirty: false,
@@ -500,7 +548,7 @@ impl App {
         }
     }
 
-    fn open_image(&mut self) {
+    fn open_image(&mut self, ctx: &egui::Context) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("image", &["png", "jpg", "jpeg", "webp", "bmp"])
             .pick_file()
@@ -515,15 +563,360 @@ impl App {
                 return;
             }
         };
-        match cmyk::load(&path, w, h) {
-            Ok(layers) => {
-                self.layers = Some(Arc::new(layers));
-                self.path = Some(path.clone());
-                self.dims = (w, h);
-                self.status = format!("{path} ({w}x{h})");
-                self.dirty = true;
+        // Display texture for the Original view. Downscale big photos so the GPU
+        // upload stays cheap; the full-res file is still what gets baked/cut.
+        match image::open(&path) {
+            Ok(img) => {
+                let disp = img.thumbnail(1600, 1600).to_rgb8();
+                let ci = egui::ColorImage::from_rgb(
+                    [disp.width() as usize, disp.height() as usize],
+                    disp.as_raw(),
+                );
+                self.orig_texture =
+                    Some(ctx.load_texture("original", ci, egui::TextureOptions::LINEAR));
             }
+            Err(e) => {
+                self.status = format!("read {path}: {e}");
+                return;
+            }
+        }
+        self.orig_path = Some(path.clone());
+        self.orig_dims = (w, h);
+        // A fresh image starts with a full-frame crop and identity perspective.
+        self.crop_min = [0.0, 0.0];
+        self.crop_max = [1.0, 1.0];
+        self.persp = Self::image_corners();
+        self.status = format!("{path} ({w}x{h})");
+        self.view = View::Original;
+        self.apply_transform();
+    }
+
+    /// The crop rectangle's four corners (TL,TR,BR,BL) in normalized coords.
+    fn crop_corners(&self) -> [[f32; 2]; 4] {
+        let ([x0, y0], [x1, y1]) = (self.crop_min, self.crop_max);
+        [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
+    }
+
+    /// The photo's own four corners in normalized coords (the identity perspective).
+    fn image_corners() -> [[f32; 2]; 4] {
+        [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]]
+    }
+
+    /// True when the crop is the full frame and the perspective is still the
+    /// image's own corners — i.e. nothing to bake, use the original file directly.
+    fn is_identity_transform(&self) -> bool {
+        let full = self.crop_min[0] <= 1e-4
+            && self.crop_min[1] <= 1e-4
+            && self.crop_max[0] >= 1.0 - 1e-4
+            && self.crop_max[1] >= 1.0 - 1e-4;
+        let ic = Self::image_corners();
+        let persp_flat = self
+            .persp
+            .iter()
+            .zip(ic.iter())
+            .all(|(p, c)| (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4);
+        full && persp_flat
+    }
+
+    /// Bake the current crop + perspective into a working image and point the
+    /// pipeline (path/dims/layers) at it. Called after a drag is released and on
+    /// open. Only the crop region is emitted, so every downstream step — preview,
+    /// stiffness, and Generate — operates on exactly what the user selected.
+    fn apply_transform(&mut self) {
+        let Some(orig) = self.orig_path.clone() else {
+            return;
+        };
+        let (ow, oh) = self.orig_dims;
+        if self.is_identity_transform() {
+            match cmyk::load(&orig, ow, oh) {
+                Ok(l) => {
+                    self.layers = Some(Arc::new(l));
+                    self.path = Some(orig);
+                    self.dims = (ow, oh);
+                    self.dirty = true;
+                }
+                Err(e) => self.status = e,
+            }
+            return;
+        }
+        // Output size = crop size in original pixels.
+        let out_w = (((self.crop_max[0] - self.crop_min[0]) * ow as f32).round() as usize).max(1);
+        let out_h = (((self.crop_max[1] - self.crop_min[1]) * oh as f32).round() as usize).max(1);
+        // Free-transform perspective: `persp` are the view positions where the
+        // photo's own corners have been dragged. The source pixel for each crop
+        // corner is that corner projected back into the (un-warped) photo via the
+        // view->image homography, then scaled to original pixels.
+        let persp64 = self.persp.map(|p| [p[0] as f64, p[1] as f64]);
+        let ic64 = Self::image_corners().map(|p| [p[0] as f64, p[1] as f64]);
+        let Some(v2i) = crate::warp::homography(persp64, ic64) else {
+            self.status = "degenerate perspective (corners collinear)".into();
+            return;
+        };
+        let crop = self.crop_corners();
+        let src = crop.map(|c| {
+            let (ix, iy) = crate::warp::project(&v2i, c[0] as f64, c[1] as f64);
+            [ix * ow as f64, iy * oh as f64]
+        });
+        let dest = std::env::temp_dir()
+            .join(format!("laser_halftone_work_{}.png", std::process::id()))
+            .display()
+            .to_string();
+        match crate::warp::bake(&orig, out_w, out_h, src, &dest) {
+            Ok(()) => match cmyk::load(&dest, out_w, out_h) {
+                Ok(l) => {
+                    // Drop the previous temp before adopting the new one.
+                    if let Some(old) = self.work_tmp.replace(dest.clone()) {
+                        if old != dest {
+                            let _ = std::fs::remove_file(old);
+                        }
+                    }
+                    self.layers = Some(Arc::new(l));
+                    self.path = Some(dest);
+                    self.dims = (out_w, out_h);
+                    self.dirty = true;
+                }
+                Err(e) => self.status = e,
+            },
             Err(e) => self.status = e,
+        }
+    }
+
+    /// The Original view: draw the photo, the crop rectangle and/or perspective
+    /// quad with draggable handles, and update the region. A render is only kicked
+    /// off when a drag is released (heavy: it re-bakes + reloads the image).
+    fn original_view(&mut self, ui: &mut egui::Ui) {
+        let Some(tex) = self.orig_texture.clone() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("Open an image to begin")
+                        .size(16.0)
+                        .color(egui::Color32::from_gray(0x66)),
+                );
+            });
+            return;
+        };
+        let [tw, th] = tex.size();
+        let avail = ui.available_size();
+        let (region, response) = ui.allocate_exact_size(avail, egui::Sense::click_and_drag());
+        let painter = ui.painter_at(region);
+
+        // Auto-fit: frame the un-warped photo [0,1]^2 together with wherever the
+        // perspective corners have been dragged, so a handle pushed outside the
+        // picture stays on screen and can always be grabbed back. The photo aspect
+        // ratio (tw:th) is preserved. to_screen/to_frac are exact inverses, so a
+        // dragged handle tracks the cursor while the picture zooms out around it.
+        let mut lo = [0.0f32, 0.0];
+        let mut hi = [1.0f32, 1.0];
+        for p in &self.persp {
+            lo[0] = lo[0].min(p[0]); lo[1] = lo[1].min(p[1]);
+            hi[0] = hi[0].max(p[0]); hi[1] = hi[1].max(p[1]);
+        }
+        let pad = 0.06; // keep handles off the very edge of the panel
+        lo[0] -= pad; lo[1] -= pad; hi[0] += pad; hi[1] += pad;
+        let bw = (hi[0] - lo[0]).max(1e-3);
+        let bh = (hi[1] - lo[1]).max(1e-3);
+        let k = (region.width() / (tw as f32 * bw))
+            .min(region.height() / (th as f32 * bh))
+            .max(1e-6);
+        let sx = k * tw as f32; // screen px per unit-x
+        let sy = k * th as f32; // screen px per unit-y
+        let center = [(lo[0] + hi[0]) * 0.5, (lo[1] + hi[1]) * 0.5];
+        let origin = region.center() - egui::vec2(center[0] * sx, center[1] * sy);
+        let to_screen = |p: [f32; 2]| origin + egui::vec2(p[0] * sx, p[1] * sy);
+        let to_frac = |s: egui::Pos2| [(s.x - origin.x) / sx, (s.y - origin.y) / sy];
+        let img_rect = egui::Rect::from_min_max(to_screen([0.0, 0.0]), to_screen([1.0, 1.0]));
+
+        // Live perspective: draw the photo as a subdivided textured mesh whose
+        // geometry follows the free-transform corners (`persp`). image->view
+        // homography maps each grid node from photo space to the dragged quad, so
+        // what you see is exactly what will be cut — no pipeline recompute.
+        let ic = Self::image_corners().map(|p| [p[0] as f64, p[1] as f64]);
+        let dst = self.persp.map(|p| [p[0] as f64, p[1] as f64]);
+        let i2v = crate::warp::homography(ic, dst);
+        {
+            const N: usize = 24; // grid subdivisions per axis
+            let mut mesh = egui::epaint::Mesh::with_texture(tex.id());
+            for gy in 0..=N {
+                for gx in 0..=N {
+                    let u = gx as f32 / N as f32;
+                    let v = gy as f32 / N as f32;
+                    // photo-space (u,v) -> view fraction (via homography, if valid).
+                    let (vx, vy) = match &i2v {
+                        Some(h) => {
+                            let (x, y) = crate::warp::project(h, u as f64, v as f64);
+                            (x as f32, y as f32)
+                        }
+                        None => (u, v),
+                    };
+                    mesh.vertices.push(egui::epaint::Vertex {
+                        pos: to_screen([vx, vy]),
+                        uv: egui::pos2(u, v),
+                        color: egui::Color32::WHITE,
+                    });
+                }
+            }
+            let idx = |gx: usize, gy: usize| (gy * (N + 1) + gx) as u32;
+            for gy in 0..N {
+                for gx in 0..N {
+                    mesh.indices.extend_from_slice(&[
+                        idx(gx, gy), idx(gx + 1, gy), idx(gx + 1, gy + 1),
+                        idx(gx, gy), idx(gx + 1, gy + 1), idx(gx, gy + 1),
+                    ]);
+                }
+            }
+            painter.add(egui::Shape::mesh(mesh));
+        }
+
+        let accent = egui::Color32::from_rgb(0xE0, 0x3A, 0x2F);
+        let hr = 6.0; // handle radius (px)
+
+        // Screen positions of the crop corners and edge midpoints.
+        let cc: Vec<egui::Pos2> = self.crop_corners().iter().map(|&p| to_screen(p)).collect();
+        let crop_edges = || {
+            let ([x0, y0], [x1, y1]) = (self.crop_min, self.crop_max);
+            let mx = (x0 + x1) * 0.5;
+            let my = (y0 + y1) * 0.5;
+            [[mx, y0], [x1, my], [mx, y1], [x0, my]] // top,right,bottom,left
+        };
+
+        match self.edit_tool {
+            EditTool::Crop => {
+                let crect = egui::Rect::from_two_pos(cc[0], cc[2]);
+                // Dim everything outside the crop so the selection is obvious.
+                let shade = egui::Color32::from_black_alpha(0x88);
+                for r in [
+                    egui::Rect::from_min_max(region.min, egui::pos2(region.max.x, crect.min.y)),
+                    egui::Rect::from_min_max(egui::pos2(region.min.x, crect.max.y), region.max),
+                    egui::Rect::from_min_max(egui::pos2(region.min.x, crect.min.y), egui::pos2(crect.min.x, crect.max.y)),
+                    egui::Rect::from_min_max(egui::pos2(crect.max.x, crect.min.y), egui::pos2(region.max.x, crect.max.y)),
+                ] {
+                    if r.is_positive() {
+                        painter.rect_filled(r, 0.0, shade);
+                    }
+                }
+                painter.rect_stroke(crect, 0.0, egui::Stroke::new(1.5, accent));
+                for &c in &cc {
+                    painter.rect_filled(egui::Rect::from_center_size(c, egui::vec2(hr * 2.0, hr * 2.0)), 2.0, accent);
+                }
+                for e in crop_edges() {
+                    let s = to_screen(e);
+                    painter.rect_filled(egui::Rect::from_center_size(s, egui::vec2(hr * 2.0, hr * 2.0)), 2.0, egui::Color32::from_gray(0xDE));
+                }
+            }
+            EditTool::Perspective => {
+                // Faint crop outline for context, then the perspective quad on top.
+                painter.rect_stroke(egui::Rect::from_two_pos(cc[0], cc[2]), 0.0, egui::Stroke::new(1.0, egui::Color32::from_gray(0x77)));
+                let pc: Vec<egui::Pos2> = self.persp.iter().map(|&p| to_screen(p)).collect();
+                for i in 0..4 {
+                    painter.line_segment([pc[i], pc[(i + 1) % 4]], egui::Stroke::new(1.5, accent));
+                }
+                for &c in &pc {
+                    painter.circle_filled(c, hr, accent);
+                    painter.circle_stroke(c, hr, egui::Stroke::new(1.0, egui::Color32::WHITE));
+                }
+            }
+        }
+
+        // Begin a drag: hit-test the active tool's handles nearest the pointer.
+        if response.drag_started() {
+            if let Some(p) = response.interact_pointer_pos() {
+                let near = |a: egui::Pos2| a.distance(p) <= hr * 2.2;
+                self.drag = match self.edit_tool {
+                    EditTool::Crop => {
+                        let mut hit = None;
+                        for i in 0..4 {
+                            if near(cc[i]) {
+                                hit = Some(Drag::CropCorner(i));
+                            }
+                        }
+                        if hit.is_none() {
+                            for (i, e) in crop_edges().iter().enumerate() {
+                                if near(to_screen(*e)) {
+                                    hit = Some(Drag::CropEdge(i));
+                                }
+                            }
+                        }
+                        if hit.is_none() && egui::Rect::from_two_pos(cc[0], cc[2]).contains(p) {
+                            hit = Some(Drag::CropBody);
+                        }
+                        hit
+                    }
+                    EditTool::Perspective => {
+                        let mut hit = None;
+                        for i in 0..4 {
+                            if near(to_screen(self.persp[i])) {
+                                hit = Some(Drag::Persp(i));
+                            }
+                        }
+                        hit
+                    }
+                };
+            }
+        }
+
+        // While dragging, update the live geometry (no re-cut yet). Crop stays in
+        // [0,1]; perspective corners may stray a little past the frame edge.
+        if response.dragged() {
+            let p = response.interact_pointer_pos().map(to_frac);
+            match (self.drag, p) {
+                (Some(Drag::CropCorner(i)), Some(f)) => {
+                    let f = [f[0].clamp(0.0, 1.0), f[1].clamp(0.0, 1.0)];
+                    match i {
+                        0 => self.crop_min = f,
+                        1 => { self.crop_max[0] = f[0]; self.crop_min[1] = f[1]; }
+                        2 => self.crop_max = f,
+                        _ => { self.crop_min[0] = f[0]; self.crop_max[1] = f[1]; }
+                    }
+                    self.normalize_crop();
+                }
+                (Some(Drag::CropEdge(i)), Some(f)) => {
+                    let f = [f[0].clamp(0.0, 1.0), f[1].clamp(0.0, 1.0)];
+                    match i {
+                        0 => self.crop_min[1] = f[1],
+                        1 => self.crop_max[0] = f[0],
+                        2 => self.crop_max[1] = f[1],
+                        _ => self.crop_min[0] = f[0],
+                    }
+                    self.normalize_crop();
+                }
+                (Some(Drag::CropBody), _) => {
+                    let d = response.drag_delta();
+                    let dx = d.x / img_rect.width();
+                    let dy = d.y / img_rect.height();
+                    // Clamp the translation so the box stays fully inside the frame.
+                    let dx = dx.clamp(-self.crop_min[0], 1.0 - self.crop_max[0]);
+                    let dy = dy.clamp(-self.crop_min[1], 1.0 - self.crop_max[1]);
+                    self.crop_min[0] += dx; self.crop_max[0] += dx;
+                    self.crop_min[1] += dy; self.crop_max[1] += dy;
+                }
+                (Some(Drag::Persp(i)), Some(f)) => {
+                    self.persp[i] = [f[0].clamp(-1.0, 2.0), f[1].clamp(-1.0, 2.0)];
+                }
+                _ => {}
+            }
+        }
+
+        // Release: commit the region and re-cut exactly once.
+        if response.drag_stopped() && self.drag.is_some() {
+            self.drag = None;
+            self.apply_transform();
+        }
+    }
+
+
+    /// Keep the crop rectangle well-formed: min < max with a small minimum size,
+    /// clamped to the frame.
+    fn normalize_crop(&mut self) {
+        for k in 0..2 {
+            self.crop_min[k] = self.crop_min[k].clamp(0.0, 1.0);
+            self.crop_max[k] = self.crop_max[k].clamp(0.0, 1.0);
+            if self.crop_max[k] < self.crop_min[k] {
+                std::mem::swap(&mut self.crop_min[k], &mut self.crop_max[k]);
+            }
+            if self.crop_max[k] - self.crop_min[k] < 0.02 {
+                self.crop_max[k] = (self.crop_min[k] + 0.02).min(1.0);
+                self.crop_min[k] = (self.crop_max[k] - 0.02).max(0.0);
+            }
         }
     }
 
@@ -714,7 +1107,7 @@ impl eframe::App for App {
             ui.heading("Laser Halftone");
             ui.add_space(6.0);
             if ui.add_sized([ui.available_width(), 30.0], egui::Button::new("Open image…")).clicked() {
-                self.open_image();
+                self.open_image(ctx);
             }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
@@ -1025,19 +1418,48 @@ impl eframe::App for App {
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(egui::Color32::from_gray(0x0E)).inner_margin(12.0))
-            .show(ctx, |ui| match &self.texture {
-            Some(tex) => {
-                let avail = ui.available_size();
-                let [tw, th] = tex.size();
-                let scale = (avail.x / tw as f32).min(avail.y / th as f32).min(1.0);
-                ui.centered_and_justified(|ui| {
-                    ui.image((tex.id(), egui::vec2(tw as f32 * scale, th as f32 * scale)));
-                });
-            }
-            None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(egui::RichText::new("Open an image to begin").size(16.0).color(egui::Color32::from_gray(0x66)));
-                });
+            .show(ctx, |ui| {
+            // View + tool toolbar: switch between the processed cut and the original
+            // photo, and (in Original) pick the crop or perspective overlay.
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.view, View::Preview, "Preview");
+                ui.selectable_value(&mut self.view, View::Original, "Original");
+                if self.view == View::Original {
+                    ui.separator();
+                    ui.selectable_value(&mut self.edit_tool, EditTool::Crop, "Crop");
+                    ui.selectable_value(&mut self.edit_tool, EditTool::Perspective, "Perspective");
+                    ui.separator();
+                    if ui.button("Reset region").clicked() {
+                        self.crop_min = [0.0, 0.0];
+                        self.crop_max = [1.0, 1.0];
+                        self.persp = Self::image_corners();
+                        self.apply_transform();
+                    }
+                    ui.label(
+                        egui::RichText::new("drag corners / edges; release to re-cut")
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
+            ui.separator();
+            match self.view {
+                View::Preview => match &self.texture {
+                    Some(tex) => {
+                        let avail = ui.available_size();
+                        let [tw, th] = tex.size();
+                        let scale = (avail.x / tw as f32).min(avail.y / th as f32).min(1.0);
+                        ui.centered_and_justified(|ui| {
+                            ui.image((tex.id(), egui::vec2(tw as f32 * scale, th as f32 * scale)));
+                        });
+                    }
+                    None => {
+                        ui.centered_and_justified(|ui| {
+                            ui.label(egui::RichText::new("Open an image to begin").size(16.0).color(egui::Color32::from_gray(0x66)));
+                        });
+                    }
+                },
+                View::Original => self.original_view(ui),
             }
         });
 
