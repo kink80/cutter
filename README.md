@@ -58,6 +58,21 @@ laser_halftone stencil  --input photo.jpg --colors 4
 The GUI lets you open an image, tweak every parameter with a live preview, and
 "Generate all layers". The CLI does the same headless.
 
+### Original view: crop + perspective
+
+The central panel has a **Preview / Original** toggle. *Original* shows the loaded
+photo with two WYSIWYG editing tools; only the selected region is cut and exported.
+
+- **Crop** — a rectangular region with draggable corner, edge, and body handles.
+  Everything outside dims so the selection is obvious.
+- **Perspective** — a free-transform 4-corner dewarp for compensating lens/keystone
+  skew. Drag a corner and the photo warps live under it (GPU textured mesh, no
+  re-render); the view auto-zooms so a corner dragged outside the frame stays
+  reachable. **Reset region** restores the full frame and identity perspective.
+
+Crop and perspective are independent — edit them in any order. The re-cut runs once
+when you release the mouse; switch back to *Preview* to inspect the screened result.
+
 Output for an N-ink halftone is one SVG per ink (`out_c.svg`, `out_m.svg`, …), each with
 corner **punch holes + registration crosshairs** at identical coordinates so the sheets
 pin onto alignment pins and line up, plus a composite `out_preview.png`.
@@ -126,8 +141,8 @@ lines — comic-book contours).
 
 **Other knobs:** `--kerf-px`, `--bridge-interval-px`/`--bridge-px` (physical tabs, laid
 out as a staggered hex lattice to keep the sheet flat), `--scurve` (spray-paint opacity
-curve), `--bilateral-px` (edge-preserving pre-filter), `--auto-levels on`, and
-`--paper A2|A3|A4|A5` + `--margin-mm` to emit at true physical size on a sheet.
+curve), `--auto-levels on`, and `--paper A2|A3|A4|A5` + `--margin-mm` to emit at true
+physical size on a sheet.
 
 ```sh
 laser_halftone halftone --input photo.jpg \
@@ -165,6 +180,7 @@ laser_halftone stencil --input photo.jpg --colors 6 \
 |------|------|
 | `src/lines.rs` | halftone: density → cut ribbons, all mark shapes, preview + export |
 | `src/cmyk.rs` | image load/resize, RGB↔CMYK, Lab k-means, ink separation (CMYK/CMYKOG) |
+| `src/warp.rs` | crop + perspective homography and dewarp bake for the Original view |
 | `src/stencil.rs` | multicolour quantize → island bridging → marching-squares trace |
 | `src/svg.rs` | geometry → SVG, paper sizing, punch holes, registration marks |
 | `src/smooth.rs` | Potrace-style ring smoothing (DP simplify + Bézier) for stencil edges |

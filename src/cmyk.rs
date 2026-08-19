@@ -261,74 +261,12 @@ pub fn snap_to_cmyk(r: u8, g: u8, b: u8) -> ([u8; 3], [f32; 4]) {
     ([px(rr), px(gg), px(bb)], [c, m, y, k])
 }
 
-/// Edge-preserving bilateral filter on an RGB image (PDF "secret sauce" §1).
-/// Averages a pixel with neighbours weighted by BOTH spatial distance and colour
-/// similarity, so it smooths sensor noise / JPEG blocks / skin texture in flat
-/// areas while keeping primary edges razor-sharp — unlike a plain Gaussian, which
-/// blurs edges into fuzzy mid-tones that turn into ugly line stubs after screening.
-/// `sigma_s` = spatial radius (px), `sigma_r` = colour sigma (0..255). radius=0 off.
-pub fn bilateral(img: &image::RgbImage, sigma_s: f32, sigma_r: f32) -> image::RgbImage {
-    if sigma_s <= 0.0 {
-        return img.clone();
-    }
-    let (w, h) = (img.width() as i32, img.height() as i32);
-    let rad = (2.0 * sigma_s).ceil() as i32; // 2-sigma window
-    let inv_s2 = 1.0 / (2.0 * sigma_s * sigma_s);
-    let inv_r2 = 1.0 / (2.0 * sigma_r * sigma_r);
-    let mut out = image::RgbImage::new(w as u32, h as u32);
-    for y in 0..h {
-        for x in 0..w {
-            let center = img.get_pixel(x as u32, y as u32).0;
-            let mut acc = [0.0f32; 3];
-            let mut wsum = 0.0f32;
-            for dy in -rad..=rad {
-                for dx in -rad..=rad {
-                    let (nx, ny) = (x + dx, y + dy);
-                    if nx < 0 || ny < 0 || nx >= w || ny >= h {
-                        continue;
-                    }
-                    let p = img.get_pixel(nx as u32, ny as u32).0;
-                    let sp = (dx * dx + dy * dy) as f32 * inv_s2;
-                    let dc: f32 = (0..3)
-                        .map(|c| {
-                            let d = p[c] as f32 - center[c] as f32;
-                            d * d
-                        })
-                        .sum();
-                    let weight = (-(sp + dc * inv_r2)).exp();
-                    for c in 0..3 {
-                        acc[c] += p[c] as f32 * weight;
-                    }
-                    wsum += weight;
-                }
-            }
-            let px = [
-                (acc[0] / wsum).round().clamp(0.0, 255.0) as u8,
-                (acc[1] / wsum).round().clamp(0.0, 255.0) as u8,
-                (acc[2] / wsum).round().clamp(0.0, 255.0) as u8,
-            ];
-            out.put_pixel(x as u32, y as u32, image::Rgb(px));
-        }
-    }
-    out
-}
-
 /// Load `path`, resize to `w`x`h` px (Lanczos3), separate into CMYK maps.
-/// `bilateral_px` > 0 applies an edge-preserving pre-smooth before separation.
 pub fn load(path: &str, w: usize, h: usize) -> Result<Layers, String> {
-    load_filtered(path, w, h, 0.0)
-}
-
-/// Like `load` but with an optional bilateral pre-filter radius (px).
-pub fn load_filtered(path: &str, w: usize, h: usize, bilateral_px: f32) -> Result<Layers, String> {
     let img = image::open(path).map_err(|e| format!("failed to open image: {e}"))?;
-    let mut img = img
+    let img = img
         .resize_exact(w as u32, h as u32, FilterType::Lanczos3)
         .to_rgb8();
-    if bilateral_px > 0.0 {
-        // sigma_r ~ 30/255: preserve edges with a colour jump above ~12%.
-        img = bilateral(&img, bilateral_px, 30.0);
-    }
 
     let n = w * h;
     let mut layers = Layers {

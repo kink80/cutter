@@ -67,7 +67,6 @@ struct Args {
     bridge_interval_px: f32, // distance between bridges along a line (0 = off)
     bridge_px: f32,        // bridge (uncut tab) length along the line
     scurve: f32,           // spray S-curve strength (0 = off)
-    bilateral_px: f32,     // edge-preserving pre-filter radius (0 = off)
     k_contour: bool,       // K mode: true = DoG edge contours, false = tonal screen
     k_deep_clip: f32,      // K deep-shadow clip Tk
     k_gamma: f32,          // K steep gamma
@@ -165,7 +164,6 @@ fn parse_args(skip: usize) -> Result<Args, String> {
         bridge_interval_px: m.get("bridge-interval-px").and_then(|s| s.parse().ok()).unwrap_or(0.0),
         bridge_px: m.get("bridge-px").and_then(|s| s.parse().ok()).unwrap_or(0.0),
         scurve: m.get("scurve").and_then(|s| s.parse().ok()).unwrap_or(0.0),
-        bilateral_px: m.get("bilateral-px").and_then(|s| s.parse().ok()).unwrap_or(0.0),
         k_contour: matches!(m.get("k-mode").map(String::as_str), Some("contour")),
         k_deep_clip: m.get("k-deep-clip").and_then(|s| s.parse().ok()).unwrap_or(0.75),
         k_gamma: m.get("k-gamma").and_then(|s| s.parse().ok()).unwrap_or(2.0),
@@ -230,7 +228,7 @@ fn run_halftone(skip: usize) -> Result<(), String> {
             a.min_cut_px, a.spacing_px, a.min_material_px, w_max_px
         ));
     }
-    for (name, v) in [("kerf-px", a.kerf_px), ("bridge-interval-px", a.bridge_interval_px), ("bridge-px", a.bridge_px), ("scurve", a.scurve), ("bilateral-px", a.bilateral_px)] {
+    for (name, v) in [("kerf-px", a.kerf_px), ("bridge-interval-px", a.bridge_interval_px), ("bridge-px", a.bridge_px), ("scurve", a.scurve)] {
         if v < 0.0 {
             return Err(format!("--{name} must be >= 0 (got {v})"));
         }
@@ -240,7 +238,7 @@ fn run_halftone(skip: usize) -> Result<(), String> {
     }
 
     let (w_px, h_px) = image_size(&a.input)?;
-    let layers = cmyk::load_filtered(&a.input, w_px, h_px, a.bilateral_px)?;
+    let layers = cmyk::load(&a.input, w_px, h_px)?;
 
     if !(0.0..1.0).contains(&a.k_deep_clip) {
         return Err(format!("--k-deep-clip must be in [0,1) (got {})", a.k_deep_clip));
@@ -405,7 +403,7 @@ const USAGE: &str = "usage (all sizes in px; output matches the input image's pi
 [--shape lines|wavy|dots|blue-noise|hatch] [--wave-amp-frac <f>] [--wave-len-frac <f>] [--wave-width-frac <f>] [--hatch-bins <n>] \
   [--dot-min-px <f>] [--dot-max-px <f>] \
 [--inks cmyk|cmykog] [--angles 15,75,0,45[,...]] [--loads 1,0.55,1,1] \
-[--kerf-px <f>] [--bridge-interval-px <f>] [--bridge-px <f>] [--scurve <f>] [--bilateral-px <f>] [--auto-levels on] \
+[--kerf-px <f>] [--bridge-interval-px <f>] [--bridge-px <f>] [--scurve <f>] [--auto-levels on] \
 [--k-mode tonal|contour] [--k-deep-clip <f>] [--k-gamma <f>] [--k-width-frac <f>] [--ucr <f>] [--dog-sigma1 <f>] [--dog-sigma2 <f>] [--dog-threshold <f>] [--paper A2|A3|A4|A5] [--margin-mm <f>] [--out-prefix <s>]\n  \
     stencil  --input <img> --colors <N> \
 [--format svg|png] [--bridges on] [--min-material-px <f>] [--bridge-px <f>] [--min-feature-px <f>] [--coarsen-px <f>] [--smooth-px <f>] [--out-prefix <s>]";

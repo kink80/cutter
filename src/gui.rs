@@ -47,7 +47,6 @@ enum Drag {
 #[derive(Clone)]
 enum Job {
     Halftone {
-        path: String,
         layers: Arc<cmyk::Layers>,
         w: usize,
         h: usize,
@@ -55,7 +54,6 @@ enum Job {
         inks: cmyk::Inks,
         angles: Vec<f32>,
         auto: bool,
-        bilateral_px: f32,
         loads: Vec<f32>,
     },
     Stencil {
@@ -142,7 +140,6 @@ struct App {
     bridge_interval_px: f32,
     ht_bridge_px: f32,
     scurve: f32,
-    bilateral_px: f32,
     k_contour: bool,   // K mode toggle: true = DoG contour, false = tonal screen
     k_deep_clip: f32,
     k_gamma: f32,
@@ -215,22 +212,10 @@ impl App {
                     job = newer;
                 }
                 let rendered = match job {
-                    Job::Halftone { path, layers, w, h, p, inks, angles, auto, bilateral_px, loads } => {
-                        // Reload with the edge-preserving pre-filter only when it's on
-                        // (it's slow); otherwise reuse the cached, unfiltered layers.
+                    Job::Halftone { layers, w, h, p, inks, angles, auto, loads } => {
                         let names = inks.names();
-                        let (buf, frag) = if bilateral_px > 0.0 {
-                            match cmyk::load_filtered(&path, w, h, bilateral_px) {
-                                Ok(l) => {
-                                    let chans = cmyk::channels(&l, inks, &angles, &loads);
-                                    lines::render_preview(&chans, w, h, &p, auto)
-                                }
-                                Err(_) => continue,
-                            }
-                        } else {
-                            let chans = cmyk::channels(&layers, inks, &angles, &loads);
-                            lines::render_preview(&chans, w, h, &p, auto)
-                        };
+                        let chans = cmyk::channels(&layers, inks, &angles, &loads);
+                        let (buf, frag) = lines::render_preview(&chans, w, h, &p, auto);
                         let frag = names.iter().map(|n| n.to_string()).zip(frag).collect();
                         Rendered { w, h, rgb: buf.into_raw(), frag }
                     }
@@ -281,7 +266,6 @@ impl App {
             bridge_interval_px: 0.0,
             ht_bridge_px: 2.0,
             scurve: 0.0,
-            bilateral_px: 0.0,
             k_contour: false,
             k_deep_clip: 0.75,
             k_gamma: 2.0,
@@ -375,7 +359,6 @@ impl App {
         let _ = writeln!(s, "bridge_interval_px = {}", self.bridge_interval_px);
         let _ = writeln!(s, "ht_bridge_px = {}", self.ht_bridge_px);
         let _ = writeln!(s, "scurve = {}", self.scurve);
-        let _ = writeln!(s, "bilateral_px = {}", self.bilateral_px);
         let _ = writeln!(s, "k_contour = {}", self.k_contour);
         let _ = writeln!(s, "k_deep_clip = {}", self.k_deep_clip);
         let _ = writeln!(s, "k_gamma = {}", self.k_gamma);
@@ -450,7 +433,6 @@ impl App {
         self.bridge_interval_px = f("bridge_interval_px", self.bridge_interval_px);
         self.ht_bridge_px = f("ht_bridge_px", self.ht_bridge_px);
         self.scurve = f("scurve", self.scurve);
-        self.bilateral_px = f("bilateral_px", self.bilateral_px);
         self.k_contour = b("k_contour", self.k_contour);
         self.k_deep_clip = f("k_deep_clip", self.k_deep_clip);
         self.k_gamma = f("k_gamma", self.k_gamma);
@@ -972,7 +954,6 @@ impl App {
         let (w, h) = self.dims;
         match self.mode {
             Mode::Halftone => Some(Job::Halftone {
-                path: self.path.clone()?,
                 layers: self.layers.clone()?,
                 w,
                 h,
@@ -980,7 +961,6 @@ impl App {
                 inks: self.inks,
                 angles: self.angles.clone(),
                 auto: self.auto_levels,
-                bilateral_px: self.bilateral_px,
                 loads: self.loads.clone(),
             }),
             Mode::Stencil => Some(Job::Stencil {
@@ -1016,7 +996,6 @@ impl App {
         let loads = self.loads.clone();
         let auto = self.auto_levels;
         let smooth = self.smooth_px;
-        let bilateral_px = self.bilateral_px;
         let paper = self.paper;
         let margin_mm = self.margin_mm;
         let tx = self.gen_tx.clone();
@@ -1026,16 +1005,7 @@ impl App {
             let mut warn = |m: String| eprintln!("warning: {m}");
             let res = match mode {
                 Mode::Halftone => {
-                    // Reload with the bilateral pre-filter for the final output if on.
-                    let loaded;
-                    let l = if bilateral_px > 0.0 {
-                        match cmyk::load_filtered(&path, w, h, bilateral_px) {
-                            Ok(x) => { loaded = std::sync::Arc::new(x); loaded.as_ref() }
-                            Err(e) => { let _ = tx.send(format!("generate failed: {e}")); return; }
-                        }
-                    } else {
-                        layers.as_ref().unwrap().as_ref()
-                    };
+                    let l = layers.as_ref().unwrap().as_ref();
                     let chans = cmyk::channels(l, inks, &angles, &loads);
                     lines::export(&chans, w, h, &hp, auto, paper, margin_mm, &prefix)
                 }
@@ -1077,7 +1047,7 @@ impl eframe::App for App {
 
         egui::SidePanel::left("controls")
             .resizable(false)
-            .exact_width(320.0)
+            .exact_width(360.0)
             .show(ctx, |ui| {
             // Pin generate + status to the bottom FIRST so egui reserves its space;
             // the scrolling controls below then fill only what's left. Without this
@@ -1294,8 +1264,14 @@ impl eframe::App for App {
                         // sparse. Pull that ink back until its STIFFNESS row goes grey.
                         // Capped at 1.0: above it, cuts would exceed spacing - min
                         // material and break the guarantee every shape relies on.
+                        // Black is tamed (opaque): its cut width comes from the
+                        // BLACK (K) section below, not from a load, so skip it here —
+                        // a K load slider would look live but do nothing.
                         let names = self.inks.names();
                         for i in 0..self.loads.len() {
+                            if names[i] == "Black" {
+                                continue;
+                            }
                             s(ui, &mut ch, &mut self.loads[i], 0.2, 1.0, names[i]);
                         }
                         ui.label(
@@ -1303,11 +1279,11 @@ impl eframe::App for App {
                                 .small()
                                 .weak(),
                         );
-                        if self.inks.names().last() == Some(&"Black") {
-                            ui.label(
-                                egui::RichText::new("(black uses K width, below)").small().weak(),
-                            );
-                        }
+                        ui.label(
+                            egui::RichText::new("black is set by BLACK (K), below")
+                                .small()
+                                .weak(),
+                        );
                     });
                     let auto_cp = if self.auto_levels {
                         self.layers.as_ref().map(|l| {
@@ -1352,9 +1328,6 @@ impl eframe::App for App {
                             s(ui, &mut ch, &mut self.k_gamma, 1.0, 3.0, "K gamma");
                             s(ui, &mut ch, &mut self.ucr, 0.0, 1.0, "under-colour removal");
                         }
-                    });
-                    section(ui, "PRE-FILTER", &mut |ui| {
-                        s(ui, &mut ch, &mut self.bilateral_px, 0.0, 6.0, "bilateral px");
                     });
                     section(ui, "SHEET", &mut |ui| {
                         // Export-only: physical paper size + margin (squeeze). Doesn't
